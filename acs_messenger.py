@@ -57,7 +57,7 @@ def fetch_records():
         "Body",
         "Attachment",
         "attempts"
-    FROM mail."MailArchive"
+    FROM mail."MailQueue"
     WHERE "deliveryMethod" IS NULL FOR UPDATE;
     """
     rows = []
@@ -79,7 +79,7 @@ def process_record(**record):
         return False # Invalid address
 
     result = None
-    if re.search("^\\d{10}"): # assume phone number
+    if re.search("^\\d{10}",target): # assume phone number
         result = send_sms(record)
     else:                    # assume email
         result = send_email(record)
@@ -88,8 +88,9 @@ def process_record(**record):
 
 def send_sms(**data):
     try:
+        target_phone_number = data["destination"].strip().split('@')[0]
         message = sms_client.messages.create(
-            to = data["destination"],  # Replace with the recipient"s phone number
+            to = target_phone_number,  # Replace with the recipient"s phone number
             from_ = data["source"],  # Replace with your Twilio phone number
             body = data["message"],
         )
