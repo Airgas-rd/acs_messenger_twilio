@@ -158,5 +158,5 @@ def running_process_check():
     return True
 
 
-if __name__ == '__main__' and not running_process_check():
+if __name__ == '__main__' and running_process_check():
     main()
