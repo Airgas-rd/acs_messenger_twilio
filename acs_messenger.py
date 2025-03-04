@@ -35,7 +35,7 @@ def main():
         conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
         records = fetch_records()
         for record in records:
-            result =  process_record(record)
+            result = process_record(record)
             if not result: continue
             archive_record(**record)
     except psycopg2.Error as e:
