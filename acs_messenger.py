@@ -6,6 +6,8 @@ import sys
 import psycopg2
 import sendgrid
 import pprint
+import base64
+import datetime
 from psycopg2.extras import DictCursor
 from twilio.rest import Client
 from sendgrid.helpers.mail import *
@@ -16,11 +18,6 @@ my_twilio_phone_number = "+18333655808"
 sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
 account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 auth_token = os.environ.get("TWILIO_CLIENT_AUTH_TOKEN")
-
-sg = sendgrid.SendGridAPIClient(sendgrid_api_key) # Sendgrid email client
-sms_client = Client(account_sid, auth_token) # Twilio sms client
-
-
 db_params = {
     "dbname": "scadabase",
     "user": "postgres",
@@ -28,8 +25,9 @@ db_params = {
     "host": "127.0.0.1",
     "port": "5432"
 }
-conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
-
+sg = None
+sms_client = None
+conn = None
 help = False
 debug = False
 testing = False
@@ -62,7 +60,8 @@ def main():
                 phone_override = arg
         if help == True:
             usage()
-            sys.exit(0)
+            return
+        initialize() # set up db connection and clients
         records = fetch_records()
         for record in records:
             result = process_record(record)
@@ -70,12 +69,20 @@ def main():
     except getopt.GetoptError as e:
         print(e)
         usage()
-        sys.exit(2)
     except psycopg2.Error as e:
         print(f"Database Error: {e}")
+    except Exception as e:
+        print(e)
     finally:
-        if conn != None:
+        if conn:
             conn.close()
+
+
+def initialize():
+    global conn, sg, sms_client
+    conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
+    sg = sendgrid.SendGridAPIClient(sendgrid_api_key) # Sendgrid email client
+    sms_client = Client(account_sid, auth_token) # Twilio sms client
 
 
 def fetch_records():
@@ -89,6 +96,7 @@ def fetch_records():
         "Subject",
         "Body",
         "Attachment",
+        OCTET_LENGTH("Attachment") AS "AttachmentLength",
         "attempts"
     FROM mail."MailQueue"
     WHERE "deliveryMethod" IS NULL FOR UPDATE;
@@ -100,10 +108,11 @@ def fetch_records():
         cur = conn.cursor()
         cur.execute(sql)
         rows = cur.fetchall()
-        cur.close()
     except psycopg2.Error as e:
         print(f"Database error: {e}")
-        conn.close()
+    finally:
+        if cur:
+            cur.close()
     return rows
 
 
@@ -123,7 +132,7 @@ def process_record(record):
 
 def send_sms(record):
     try:
-        if phone_override != None:
+        if phone_override is not None:
             record["DestinationAddress"] = phone_override
         target_phone_number = record["DestinationAddress"].strip().split('@')[0]
         body = record["Body"]
@@ -152,9 +161,6 @@ def send_email(record):
         if email_override:
             record["DestinationAddress"] = email_override
         recipient = record["DestinationAddress"]
-        if nonotify == True:
-            print(f"Notifications disabled. No messages will be sent to {email_override}")
-            return True # pretend like it worked
         mail = Mail(
             from_email = record["SourceAddress"],
             subject = record["Subject"],
@@ -162,19 +168,32 @@ def send_email(record):
         )
         personalization = Personalization()
         personalization.add_to(To(recipient))
-        if record["CC_Address"] != None and len(record["CC_Address"].strip().split(',')) > 0:
+        if record["CC_Address"] is not None and len(record["CC_Address"].strip().split(',')) > 0:
             list = record["CC_Address"].strip().split(',')
             for cc in list:
                 val = cc.strip()
                 if len(val) < 6: continue # a@b.me -> anything shorter is prob bogus
                 personalization.add_cc(Cc(val))
-        if record["BCC_Address"] != None and len(record["BCC_Address"].strip().split(',')) > 0:
+        if record["BCC_Address"] is not None and len(record["BCC_Address"].strip().split(',')) > 0:
             list = record["BCC_Address"].strip().split(',')
             for bcc in list:
                 val = bcc.strip()
                 if len(val) < 6: continue # a@b.me -> anything shorter is prob bogus
                 personalization.add_bcc(Bcc(val))
         mail.add_personalization(personalization)
+        if  record["AttachmentLength"] > 5: # Arbitrary threshold for the number of bytes until we should be checking for null value in Attachment column but junck
+            basename = re.sub("\\s+","_",record["Subject"].strip().lower()) # acs_report_name
+            suffix = datetime.datetime.now(datetime.timezone.utc).strftime("_%Y_%m_%d_%H_%M_%S.csv")
+            name = basename + suffix # acs_report_name_YYYY_mm_dd_HH_MM_SS.csv
+            file_name = FileName(name)
+            file_content = FileContent(base64.b64encode(record["Attachment"]).decode('utf-8'))
+            file_type = FileType("text/csv")
+            disposition = Disposition("attachment")
+            attachment = Attachment(file_content,file_name,file_type,disposition)
+            mail.add_attachment(attachment)
+            if nonotify == True:
+                print(f"Notifications disabled. No messages will be sent to {email_override}")
+                return True # pretend like it worked
         response = sg.client.mail.send.post(request_body = mail.get())
         if debug == True:
             print("Email Payload")
@@ -196,9 +215,7 @@ def archive_record(record,success):
     bcc = record["BCC_Address"]
     subject = record["Subject"]
     body = record["Body"]
-    attachment = record["Attachment"]
     table = 'mail."MailArchive"' if success else 'mail."FailedMail"'
-
     try:
         cur = conn.cursor()
         sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
@@ -213,9 +230,9 @@ def archive_record(record,success):
         else:
             cur.execute(sql,params)
         sql = f"INSERT INTO {table}\n"
-        sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment","DateSent")\n'
-        sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
-        params = (destination,source,cc,bcc,subject,body,attachment)
+        sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","DateSent")\n'
+        sql += 'VALUES (%s,%s,%s,%s,%s,%s,NOW());'
+        params = (destination,source,cc,bcc,subject,body) # discard attachments after sending
         if debug == True:
             q = sql
             for val in params:
@@ -228,13 +245,15 @@ def archive_record(record,success):
         conn.commit()
     except psycopg2.Error as e:
         print(f"Database Error: {e}")
-        conn.close()
+    finally:
+        if cur:
+            cur.close()
 
 
 def running_process_check():
     pid = os.getpid()
     for process in psutil.process_iter(["pid","name"]):
-        if process.info["name"] == __file__ and process.info["pid"] != pid:
+        if process.info["name"] == __file__ and process.info["pid"] is not pid:
             print(f"{__file__} is already running.")
             return False
     return True
@@ -248,6 +267,7 @@ def usage():
     print("  -n, --nonotify  No sms or email sent - useful for testing")
     print("  -e, --email     Override email recipient - useful for testing")
     print("  -p, --phone     Override sms/text recipient - useful for testing")
+
 
 if __name__ == '__main__' and running_process_check():
     main()
