@@ -58,7 +58,7 @@ def main():
             elif opt.strip() in ["-p","--phone"]:
                 global phone_override
                 phone_override = arg
-        if help == True:
+        if help is True:
             usage()
             return
         initialize() # set up db connection and clients
@@ -101,7 +101,7 @@ def fetch_records():
     FROM mail."MailQueue"
     WHERE "deliveryMethod" IS NULL FOR UPDATE;
     """
-    if debug == True:
+    if debug is True:
         print(sql)
     rows = []
     try:
@@ -136,7 +136,7 @@ def send_sms(record):
             record["DestinationAddress"] = phone_override
         target_phone_number = record["DestinationAddress"].strip().split('@')[0]
         body = record["Body"]
-        if nonotify == True:
+        if nonotify is True:
             print(f"Notifications disabled. No messages will be sent to {target_phone_number}")
             return True # pretend like it worked
         message = sms_client.messages.create(
@@ -144,7 +144,7 @@ def send_sms(record):
             from_ = my_twilio_phone_number,  # Replace with your Twilio phone number
             body = body,
         )
-        if debug == True:
+        if debug is True:
             print(f"Message to {target_phone_number}")
             print(f"Body: {body}")
             print(f"Status: {message.status}")
@@ -181,7 +181,7 @@ def send_email(record):
                 if len(val) < 6: continue # a@b.me -> anything shorter is prob bogus
                 personalization.add_bcc(Bcc(val))
         mail.add_personalization(personalization)
-        if  record["AttachmentLength"] > 5: # Arbitrary threshold for the number of bytes until we should be checking for null value in Attachment column but junck
+        if  record["AttachmentLength"] > 5: # Arbitrary threshold for the number of bytes until we can check for null value in Attachment
             basename = re.sub("\\s+","_",record["Subject"].strip().lower()) # acs_report_name
             suffix = datetime.datetime.now(datetime.timezone.utc).strftime("_%Y_%m_%d_%H_%M_%S.csv")
             name = basename + suffix # acs_report_name_YYYY_mm_dd_HH_MM_SS.csv
@@ -191,11 +191,11 @@ def send_email(record):
             disposition = Disposition("attachment")
             attachment = Attachment(file_content,file_name,file_type,disposition)
             mail.add_attachment(attachment)
-            if nonotify == True:
+            if nonotify is True:
                 print(f"Notifications disabled. No messages will be sent to {email_override}")
                 return True # pretend like it worked
         response = sg.client.mail.send.post(request_body = mail.get())
-        if debug == True:
+        if debug is True:
             print("Email Payload")
             pprint.pprint(mail.get(),indent=4)
             print(f"Email response code: {response.status_code}")
@@ -220,7 +220,7 @@ def archive_record(record,success):
         cur = conn.cursor()
         sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
         params = (id,)
-        if debug == True:
+        if debug is True:
             q = sql
             for val in params:
                 q = q.replace('%s',f"'{str(val)}'",1)
@@ -233,7 +233,7 @@ def archive_record(record,success):
         sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","DateSent")\n'
         sql += 'VALUES (%s,%s,%s,%s,%s,%s,NOW());'
         params = (destination,source,cc,bcc,subject,body) # discard attachments after sending
-        if debug == True:
+        if debug is True:
             q = sql
             for val in params:
                 q = q.replace('%s',f"'{str(val)}'",1)
