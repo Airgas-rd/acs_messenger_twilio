@@ -96,7 +96,7 @@ def fetch_records():
         "Subject",
         "Body",
         "Attachment",
-        OCTET_LENGTH("Attachment") AS "AttachmentLength",
+        COALESCE(OCTET_LENGTH("Attachment"),0) AS "AttachmentLength",
         "attempts"
     FROM mail."MailQueue"
     WHERE "deliveryMethod" IS NULL FOR UPDATE;
@@ -161,8 +161,10 @@ def send_email(record):
         if email_override:
             record["DestinationAddress"] = email_override
         recipient = record["DestinationAddress"]
+        sender = record["SourceAddress"]
+        sender = 'bamsupport@airgas-rd.com' # override until mail.airgas-rd.com is validated with twilio
         mail = Mail(
-            from_email = record["SourceAddress"],
+            from_email = sender,
             subject = record["Subject"],
             html_content = record["Body"]
         )
