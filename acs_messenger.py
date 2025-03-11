@@ -15,7 +15,7 @@ from sendgrid.helpers.mail import *
 
 my_twilio_phone_number = "+18333655808"
 
-# Values set in /etc/envrionment
+# Values set in /etc/environment
 sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
 account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 auth_token = os.environ.get("TWILIO_CLIENT_AUTH_TOKEN")
@@ -83,7 +83,7 @@ def initialize():
 
         with open(db_params_filepath) as db_params_file:
             db_params = json.load(db_params_file)
-
+        
         if debug is True: print(db_params)
         db_params["password"] = pgpassword
         conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
@@ -142,19 +142,28 @@ def send_sms(record):
     try:
         if phone_override is not None:
             record["DestinationAddress"] = phone_override
-        target_phone_number = record["DestinationAddress"].strip().split('@')[0]
-        body = record["Body"]
+        destination = record["DestinationAddress"].strip().split('@')
+        target_phone_number = destination[0]
+        domain = destination[1] if len(destination) > 1 else None 
+        subject = record["Subject"].strip()
+        body = record["Body"].strip()
+        msg = None
+        if domain is not None: # It's a device
+            msg = f"SUBJ:{subject}\nMSG:{body}"
+        else:
+            msg = body
+
         if nonotify is True:
             print(f"Notifications disabled. No messages will be sent to {target_phone_number}")
             return True # pretend like it worked
         message = sms_client.messages.create(
             to = target_phone_number,  # Replace with the recipient"s phone number
             from_ = my_twilio_phone_number,  # Replace with your Twilio phone number
-            body = body,
+            body = msg,
         )
         if debug is True:
             print(f"Message to {target_phone_number}")
-            print(f"Body: {body}")
+            print(f"Body: {msg}")
             print(f"Status: {message.status}")
         if message.error_code:
             raise Exception(f"SMS error {message.error_code} {message.error_message}")
