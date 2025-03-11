@@ -8,23 +8,21 @@ import sendgrid
 import pprint
 import base64
 import datetime
+import json
 from psycopg2.extras import DictCursor
 from twilio.rest import Client
 from sendgrid.helpers.mail import *
 
 my_twilio_phone_number = "+18333655808"
 
-#source ./sendgrid.env
+# Values set in /etc/envrionment
 sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
 account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 auth_token = os.environ.get("TWILIO_CLIENT_AUTH_TOKEN")
-db_params = {
-    "dbname": "scadabase",
-    "user": "postgres",
-    "password": "hydrogen",
-    "host": "127.0.0.1",
-    "port": "5432"
-}
+pgpassword = os.environ.get("PGPASSWORD")
+
+db_params_filepath = "/home/netadmin/scripts/db_params.json"
+
 sg = None
 sms_client = None
 conn = None
@@ -79,10 +77,20 @@ def main():
 
 
 def initialize():
-    global conn, sg, sms_client
-    conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
-    sg = sendgrid.SendGridAPIClient(sendgrid_api_key) # Sendgrid email client
-    sms_client = Client(account_sid, auth_token) # Twilio sms client
+    try:
+        db_params = None
+        global conn, sg, sms_client
+
+        with open(db_params_filepath) as db_params_file:
+            db_params = json.load(db_params_file)
+
+        if debug is True: print(db_params)
+        db_params["password"] = pgpassword
+        conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
+        sg = sendgrid.SendGridAPIClient(sendgrid_api_key) # Sendgrid email client
+        sms_client = Client(account_sid, auth_token) # Twilio sms client
+    except Exception as e:
+        raise Exception(e)
 
 
 def fetch_records():
