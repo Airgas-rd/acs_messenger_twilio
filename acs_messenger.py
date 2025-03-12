@@ -20,8 +20,9 @@ sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
 account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 auth_token = os.environ.get("TWILIO_CLIENT_AUTH_TOKEN")
 pgpassword = os.environ.get("PGPASSWORD")
+user_home = os.environ.get("HOME")
 
-db_params_filepath = "/home/netadmin/scripts/db_params.json"
+db_params_filepath = f"{user_home}/scripts/db_params.json"
 
 sg = None
 sms_client = None
@@ -32,11 +33,14 @@ testing = False
 nonotify = False
 email_override = None
 phone_override = None
+mode = None
 
 def main():
     try:
         # Get options and arguments
-        opts, args = getopt.getopt(sys.argv[1:], "hdtne:p:", ["help", "debug", "testing","no-notify","email=","phone="])
+        opts, args = getopt.getopt(sys.argv[1:],
+                                   "hdtnm:e:p:",
+                                   ["help", "debug", "testing","mode=","no-notify","email=","phone="])
         for opt, arg in opts:
             if opt in ["-h","--help"]:
                 global help
@@ -52,13 +56,25 @@ def main():
                 nonotify = True
             elif opt.strip() in ["-e","--email"]:
                 global email_override
-                email_override = arg
+                email_override = arg.strip()
             elif opt.strip() in ["-p","--phone"]:
                 global phone_override
-                phone_override = arg
+                phone_override = arg.strip()
+            elif opt.strip() in ["-m", "--mode"]:
+                global mode
+                mode = arg.strip()
+
         if help is True:
             usage()
             return
+
+        if (mode is not None
+            and not re.match('^reports?$',mode)
+            and not re.match('^notifications?$',mode)):
+            print(f"Invalid mode value: {mode}")
+            usage()
+            return
+
         initialize() # set up db connection and clients
         records = fetch_records()
         for record in records:
@@ -83,7 +99,7 @@ def initialize():
 
         with open(db_params_filepath) as db_params_file:
             db_params = json.load(db_params_file)
-        
+
         if debug is True: print(db_params)
         db_params["password"] = pgpassword
         conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
@@ -94,7 +110,13 @@ def initialize():
 
 
 def fetch_records():
-    sql = """
+    constraint = "TRUE" # Gets all records
+    if mode is not None and re.match('^reports?$',mode):
+        constraint = '"Attachment" IS NOT NULL' # Records WITH DATA in "Attachment" column
+    elif mode is not None and re.match('^notifications?$',mode): #
+        constraint = '"Attachment" IS NULL' # Records with NO data in "Attachment"
+
+    sql = f"""
     SELECT
         "ID",
         "DestinationAddress",
@@ -107,7 +129,9 @@ def fetch_records():
         COALESCE(OCTET_LENGTH("Attachment"),0) AS "AttachmentLength",
         "attempts"
     FROM mail."MailQueue"
-    WHERE "deliveryMethod" IS NULL FOR UPDATE;
+    WHERE "deliveryMethod" IS NULL
+    AND {constraint}
+    FOR UPDATE;
     """
     if debug is True:
         print(sql)
@@ -144,7 +168,7 @@ def send_sms(record):
             record["DestinationAddress"] = phone_override
         destination = record["DestinationAddress"].strip().split('@')
         target_phone_number = destination[0]
-        domain = destination[1] if len(destination) > 1 else None 
+        domain = destination[1] if len(destination) > 1 else None
         subject = record["Subject"].strip()
         body = record["Body"].strip()
         msg = None
@@ -280,12 +304,13 @@ def running_process_check():
 def usage():
     print("Usage: acs_messenger.py [options] [arguments]")
     print("Options:")
-    print("  -h, --help      Show this help message and exit")
+    print("  -m, --mode      report(s) | notification(s) DEFAULT (send both)")
     print("  -d, --debug     Show SQL queries")
     print("  -t, --testing   No database changes made")
     print("  -n, --nonotify  No sms or email sent - useful for testing")
     print("  -e, --email     Override email recipient - useful for testing")
     print("  -p, --phone     Override sms/text recipient - useful for testing")
+    print("  -h, --help      Show this help message and exit")
 
 
 if __name__ == '__main__' and running_process_check():
