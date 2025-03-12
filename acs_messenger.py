@@ -8,6 +8,7 @@ import sendgrid
 import pprint
 import base64
 import datetime
+import time
 import json
 from psycopg2.extras import DictCursor
 from twilio.rest import Client
@@ -76,10 +77,14 @@ def main():
             return
 
         initialize() # set up db connection and clients
-        records = fetch_records()
-        for record in records:
-            result = process_record(record)
-            archive_record(record,result)
+        while True:
+            records = fetch_records()
+            if len(records) < 1:
+                time.sleep(1)
+                continue
+            for record in records:
+                result = process_record(record)
+                archive_record(record,result)
     except getopt.GetoptError as e:
         print(e)
         usage()
