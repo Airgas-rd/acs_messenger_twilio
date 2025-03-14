@@ -36,46 +36,9 @@ email_override = None
 phone_override = None
 mode = None
 
+
 def main():
     try:
-        # Get options and arguments
-        opts, args = getopt.getopt(sys.argv[1:],
-                                   "hdtnm:e:p:",
-                                   ["help", "debug", "testing","mode=","no-notify","email=","phone="])
-        for opt, arg in opts:
-            if opt in ["-h","--help"]:
-                global help
-                help = True
-            elif opt in ["-d","--debug"]:
-                global debug
-                debug = True
-            elif opt in ["-t","--testing"]:
-                global testing
-                testing = True
-            elif opt in ["-n","--no-notify"]:
-                global nonotify
-                nonotify = True
-            elif opt.strip() in ["-e","--email"]:
-                global email_override
-                email_override = arg.strip()
-            elif opt.strip() in ["-p","--phone"]:
-                global phone_override
-                phone_override = arg.strip()
-            elif opt.strip() in ["-m", "--mode"]:
-                global mode
-                mode = arg.strip()
-
-        if help is True:
-            usage()
-            return
-
-        if (mode is not None
-            and not re.match('^reports?$',mode)
-            and not re.match('^notifications?$',mode)):
-            print(f"Invalid mode value: {mode}")
-            usage()
-            return
-
         initialize() # set up db connection and clients
         while True:
             records = fetch_records()
@@ -89,7 +52,7 @@ def main():
         print(e)
         usage()
     except psycopg2.Error as e:
-        print(f"Database Error: {e}")
+        print(e)
     except Exception as e:
         print(e)
     finally:
@@ -146,7 +109,7 @@ def fetch_records():
         cur.execute(sql)
         rows = cur.fetchall()
     except psycopg2.Error as e:
-        print(f"Database error: {e}")
+        print(f"Error in fetch_records: {e}")
     finally:
         if cur:
             cur.close()
@@ -197,7 +160,7 @@ def send_sms(record):
         if message.error_code:
             raise Exception(f"SMS error {message.error_code} {message.error_message}")
     except Exception as e:
-        print(e)
+        print("Error in send_sms: {e}")
         return False
     return True
 
@@ -239,18 +202,21 @@ def send_email(record):
             disposition = Disposition("attachment")
             attachment = Attachment(file_content,file_name,file_type,disposition)
             mail.add_attachment(attachment)
-            if nonotify is True:
-                print(f"Notifications disabled. No messages will be sent to {email_override}")
+        if nonotify is True:
+                print(f"Notifications disabled. No messages will be sent to {recipient}")
                 return True # pretend like it worked
+        
         response = sg.client.mail.send.post(request_body = mail.get())
+        
         if debug is True:
             print("Email Payload")
             pprint.pprint(mail.get(),indent=4)
             print(f"Email response code: {response.status_code}")
         if response.status_code < 200 or response.status_code > 204:
+            print(response.to_dict)
             raise Exception(f"Email request failed with code {response.status_code}")
     except Exception as e:
-        print(e)
+        print(f"Error in send_email: {e}")
         return False
     return True
 
@@ -292,18 +258,42 @@ def archive_record(record,success):
             cur.execute(sql,params)
         conn.commit()
     except psycopg2.Error as e:
-        print(f"Database Error: {e}")
+        print(f"Error in archive_record: {e}")
     finally:
         if cur:
             cur.close()
 
 
 def running_process_check():
-    pid = os.getpid()
-    for process in psutil.process_iter(["pid","name"]):
-        if process.info["name"] == __file__ and process.info["pid"] is not pid:
-            print(f"{__file__} is already running.")
-            return False
+    mypid = os.getpid()
+    myscriptname = os.path.basename(__file__)
+    
+    for process in psutil.process_iter(["cmdline","pid"]):
+        pid = process.info["pid"]
+        cmdline = process.info["cmdline"]
+        for idx, val in enumerate(cmdline):
+            script = os.path.basename(val)
+            if script == myscriptname and pid != mypid:
+                args = cmdline[idx+1:]
+                mode_args = [] 
+                for arg in args:
+                    if re.match('^.*reports?$',arg.strip()):
+                        mode_args.append('reports')  # make them plural for easy string comp below
+                    if re.match('^.*notifications?$',arg.strip()):
+                        mode_args.append('notifications')
+                if mode_args == []:
+                    if debug:
+                        print(f"{script} is already running in an undifferentiated mode - Sending reports AND notifications.")
+                    return False
+                for arg in mode_args:
+                    if mode is None:
+                        if debug:
+                            print(f"{script} is already running in {arg} mode - Cannot run this instance in undifferentiated mode.")
+                            return False
+                    if mode in arg:
+                        if debug:
+                            print(f"{script} is already running in {mode} mode.")
+                        return False
     return True
 
 def usage():
@@ -318,5 +308,46 @@ def usage():
     print("  -h, --help      Show this help message and exit")
 
 
-if __name__ == '__main__' and running_process_check():
-    main()
+def parse_args():
+    # Get options and arguments
+    opts, args = getopt.getopt(sys.argv[1:],"hdtnm:e:p:",
+            ["help", "debug", "testing","mode=","no-notify","email=","phone="])
+    for opt, arg in opts:
+        if opt in ["-h","--help"]:
+            global help
+            help = True
+        elif opt in ["-d","--debug"]:
+            global debug
+            debug = True
+        elif opt in ["-t","--testing"]:
+            global testing
+            testing = True
+        elif opt in ["-n","--no-notify"]:
+            global nonotify
+            nonotify = True
+        elif opt.strip() in ["-e","--email"]:
+            global email_override
+            email_override = arg.strip()
+        elif opt.strip() in ["-p","--phone"]:
+            global phone_override
+            phone_override = arg.strip()
+        elif opt.strip() in ["-m", "--mode"]:
+            global mode
+            mode = arg.strip()
+
+    if help is True:
+        usage()
+        sys.exit(0)
+
+    if (mode is not None
+        and not re.match('^reports?$',mode)
+        and not re.match('^notifications?$',mode)):
+        print(f"Invalid mode value: {mode}")
+        usage()
+        sys.exit(1)
+
+if __name__ == '__main__':
+    parse_args()
+    if running_process_check():
+        main()
+
