@@ -35,7 +35,7 @@ nonotify = False
 email_override = None
 phone_override = None
 mode = None
-
+loop = False
 
 def main():
     try:
@@ -43,8 +43,10 @@ def main():
         while True:
             records = fetch_records()
             if len(records) < 1:
-                time.sleep(1)
-                continue
+                if loop is True:
+                    time.sleep(1)
+                    continue
+                break
             for record in records:
                 result = process_record(record)
                 archive_record(record,result)
@@ -271,6 +273,8 @@ def running_process_check():
     for process in psutil.process_iter(["cmdline","pid"]):
         pid = process.info["pid"]
         cmdline = process.info["cmdline"]
+        if cmdline is None:
+            continue
         for idx, val in enumerate(cmdline):
             script = os.path.basename(val)
             if script == myscriptname and pid != mypid:
@@ -300,6 +304,7 @@ def usage():
     print("Usage: acs_messenger.py [options] [arguments]")
     print("Options:")
     print("  -m, --mode      report(s) | notification(s) DEFAULT (send both)")
+    print("  -l, --loop      Script run perpetually - polls DB every second for new records")
     print("  -d, --debug     Show SQL queries")
     print("  -t, --testing   No database changes made")
     print("  -n, --nonotify  No sms or email sent - useful for testing")
@@ -310,8 +315,8 @@ def usage():
 
 def parse_args():
     # Get options and arguments
-    opts, args = getopt.getopt(sys.argv[1:],"hdtnm:e:p:",
-            ["help", "debug", "testing","mode=","no-notify","email=","phone="])
+    opts, args = getopt.getopt(sys.argv[1:],"hdtnlm:e:p:",
+            ["help", "debug", "testing","mode=","no-notify","loop","email=","phone="])
     for opt, arg in opts:
         if opt in ["-h","--help"]:
             global help
@@ -325,6 +330,9 @@ def parse_args():
         elif opt in ["-n","--no-notify"]:
             global nonotify
             nonotify = True
+        elif opt in ["-l","--loop"]:
+            global loop
+            loop = True
         elif opt.strip() in ["-e","--email"]:
             global email_override
             email_override = arg.strip()
