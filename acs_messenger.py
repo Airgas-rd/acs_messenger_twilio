@@ -175,7 +175,7 @@ def send_email(record):
         mail = Mail(
             from_email = sender,
             subject = record["Subject"],
-            html_content = record["Body"]
+            plain_text_content = record["Body"]
         )
         personalization = Personalization()
         personalization.add_to(To(recipient))
