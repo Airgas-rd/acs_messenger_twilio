@@ -50,7 +50,6 @@ def main():
                 continue
             else:
                 break
-            
     except getopt.GetoptError as e:
         print(e)
         usage()
