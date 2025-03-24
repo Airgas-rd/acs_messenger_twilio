@@ -42,14 +42,15 @@ def main():
         initialize() # set up db connection and clients
         while True:
             records = fetch_records()
-            if len(records) < 1:
-                if loop is True:
-                    time.sleep(1)
-                    continue
-                break
             for record in records:
                 result = process_record(record)
                 archive_record(record,result)
+            if loop is True:
+                time.sleep(1)
+                continue
+            else:
+                break
+            
     except getopt.GetoptError as e:
         print(e)
         usage()
@@ -307,7 +308,7 @@ def usage():
     print("  -l, --loop      Script run perpetually - polls DB every second for new records")
     print("  -d, --debug     Show SQL queries")
     print("  -t, --testing   No database changes made")
-    print("  -n, --nonotify  No sms or email sent - useful for testing")
+    print("  -n, --no-notify No sms or email sent - useful for testing")
     print("  -e, --email     Override email recipient - useful for testing")
     print("  -p, --phone     Override sms/text recipient - useful for testing")
     print("  -h, --help      Show this help message and exit")
