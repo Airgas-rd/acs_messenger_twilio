@@ -10,11 +10,13 @@ import base64
 import datetime
 import time
 import json
+import platform
 from psycopg2.extras import DictCursor
 from twilio.rest import Client
 from sendgrid.helpers.mail import *
 
 my_twilio_phone_number = "+18333655808"
+hostname = platform.node().split('.')[0]
 
 # Values set in /etc/environment
 sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
@@ -87,29 +89,41 @@ def fetch_records():
         constraint = '"Attachment" IS NULL' # Records with NO data in "Attachment"
 
     sql = f"""
-    SELECT
-        "ID",
-        "DestinationAddress",
-        "SourceAddress",
-        "CC_Address",
-        "BCC_Address",
-        "Subject",
-        "Body",
-        "Attachment",
-        COALESCE(OCTET_LENGTH("Attachment"),0) AS "AttachmentLength",
-        "attempts"
-    FROM mail."MailQueue"
-    WHERE "deliveryMethod" IS NULL
-    AND {constraint}
-    FOR UPDATE;
+    UPDATE mail."MailQueue"
+    SET processed_by = %s, attempts = attempts + 1
+    WHERE "ID" IN (
+        SELECT "ID" 
+        FROM mail."MailQueue"
+        WHERE "deliveryMethod" IS NULL -- filter out CAM messages bc they fetch via REST
+        AND (
+            processed_by IS NULL -- record is available for processing
+            OR processed_by = %s -- previously attempted but failed for some reason
+            OR (processed_by <> %s AND created_at < NOW() - '15 minutes'::interval) -- previously attempted by another node that died or is falling behind
+        )
+        AND {constraint}
+        AND attempts <= 3
+        ORDER BY "ID" ASC -- FIFO
+        LIMIT 10
+        FOR UPDATE SKIP LOCKED
+    ) RETURNING "ID","DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment",processed_by 
     """
+    params = (hostname,hostname,hostname)
+
     if debug is True:
-        print(sql)
+        q = sql
+        for val in params:
+            q = q.replace('%s',f"'{str(val)}'",1)
+        print(q)
+
     rows = []
     try:
         cur = conn.cursor()
-        cur.execute(sql)
+        cur.execute(sql,params)
         rows = cur.fetchall()
+        if testing is True:
+            conn.rollback()
+        else:
+            conn.commit()
     except psycopg2.Error as e:
         print(f"Error in fetch_records: {e}")
     finally:
@@ -194,7 +208,7 @@ def send_email(record):
                 if len(val) < 6: continue # a@b.me -> anything shorter is prob bogus
                 personalization.add_bcc(Bcc(val))
         mail.add_personalization(personalization)
-        if  record["AttachmentLength"] > 5: # Arbitrary threshold for the number of bytes until we can check for null value in Attachment
+        if  record["Attachment"] is not None: # Arbitrary threshold for the number of bytes until we can check for null value in Attachment
             basename = re.sub("\\s+","_",record["Subject"].strip().lower()) # acs_report_name
             suffix = datetime.datetime.now(datetime.timezone.utc).strftime("_%Y_%m_%d_%H_%M_%S.csv")
             name = basename + suffix # acs_report_name_YYYY_mm_dd_HH_MM_SS.csv
@@ -258,7 +272,7 @@ def archive_record(record,success):
             print("Test mode enabled. No changes made")
         else:
             cur.execute(sql,params)
-        conn.commit()
+            conn.commit()
     except psycopg2.Error as e:
         print(f"Error in archive_record: {e}")
     finally:
