@@ -16,6 +16,7 @@ from twilio.rest import Client
 from sendgrid.helpers.mail import *
 
 my_twilio_phone_number = "+18333655808"
+twilio_magic_number_for_testing = "+15005550006" # https://www.twilio.com/docs/messaging/tutorials/automate-testing
 hostname = platform.node().split('.')[0]
 
 # Values set in /etc/environment
@@ -33,11 +34,14 @@ conn = None
 help = False
 debug = False
 testing = False
-nonotify = False
+no_notify = False
 email_override = None
 phone_override = None
 mode = None
 loop = False
+job_id = None
+
+my_process_identifier = None # Used to differentiate independent job processes - created in parse_args()
 
 def main():
     try:
@@ -98,7 +102,7 @@ def fetch_records():
         AND (
             processed_by IS NULL -- record is available for processing
             OR processed_by = %s -- previously attempted but failed for some reason
-            OR (processed_by <> %s AND created_at < NOW() - '15 minutes'::interval) -- previously attempted by another node that died or is falling behind
+            OR (processed_by <> %s AND created_at < NOW() - '15 minutes'::interval) -- previously attempted by another process that died or is falling behind
         )
         AND {constraint}
         AND attempts <= 3
@@ -107,7 +111,8 @@ def fetch_records():
         FOR UPDATE SKIP LOCKED
     ) RETURNING "ID","DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment",processed_by 
     """
-    params = (hostname,hostname,hostname)
+
+    params = (my_process_identifier,my_process_identifier,my_process_identifier)
 
     if debug is True:
         q = sql
@@ -161,7 +166,7 @@ def send_sms(record):
         else:
             msg = body
 
-        if nonotify is True:
+        if no_notify is True:
             print(f"Notifications disabled. No messages will be sent to {target_phone_number}")
             return True # pretend like it worked
         message = sms_client.messages.create(
@@ -218,7 +223,7 @@ def send_email(record):
             disposition = Disposition("attachment")
             attachment = Attachment(file_content,file_name,file_type,disposition)
             mail.add_attachment(attachment)
-        if nonotify is True:
+        if no_notify is True:
                 print(f"Notifications disabled. No messages will be sent to {recipient}")
                 return True # pretend like it worked
         
@@ -293,44 +298,52 @@ def running_process_check():
             script = os.path.basename(val)
             if script == myscriptname and pid != mypid:
                 args = cmdline[idx+1:]
-                mode_args = [] 
-                for arg in args:
-                    if re.match('^.*reports?$',arg.strip()):
-                        mode_args.append('reports')  # make them plural for easy string comp below
-                    if re.match('^.*notifications?$',arg.strip()):
-                        mode_args.append('notifications')
-                if mode_args == []:
-                    if debug:
-                        print(f"{script} is already running in an undifferentiated mode - Sending reports AND notifications.")
-                    return False
-                for arg in mode_args:
-                    if mode is None:
+                other_mode = ""
+                other_job_id = ""
+                i = 0
+                while i < len(args):
+                    parameter = args[i]
+                    if parameter in ["-m","--mode"] or re.match('--mode=',parameter): # found mode
+                        if re.match('--mode=',parameter): # long format --key=value
+                            other_mode = parameter.split('=')[-1]
+                        else: # short format -k 'v'
+                            other_mode = args[i]
+
+                        if re.match('^reports?$',other_mode):
+                            other_mode = 'report'
+                        elif re.match('^notifications?$',other_mode):
+                            other_mode = 'notification' 
+                    elif parameter in ["-j","--job-id"] or re.match('--job-id=',parameter): # found job id
+                        if re.match('--job-id=',parameter):
+                            other_job_id = parameter.split('=')[-1]
+                        else:
+                             other_job_id = args[i]
+                    if my_process_identifier == f"{hostname}-{other_mode}-{other_job_id}":
                         if debug:
-                            print(f"{script} is already running in {arg} mode - Cannot run this instance in undifferentiated mode.")
-                            return False
-                    if mode in arg:
-                        if debug:
-                            print(f"{script} is already running in {mode} mode.")
-                        return False
+                            print(f'{script} with identifier "{my_process_identifier}" found. Exiting')
+                        return False   
+                    i += 1             
     return True
+
 
 def usage():
     print("Usage: acs_messenger.py [options] [arguments]")
     print("Options:")
-    print("  -m, --mode      report(s) | notification(s) DEFAULT (send both)")
+    print("  -m, --mode      report | notification DEFAULT (send both)")
     print("  -l, --loop      Script run perpetually - polls DB every second for new records")
     print("  -d, --debug     Show SQL queries")
     print("  -t, --testing   No database changes made")
     print("  -n, --no-notify No sms or email sent - useful for testing")
     print("  -e, --email     Override email recipient - useful for testing")
     print("  -p, --phone     Override sms/text recipient - useful for testing")
+    print("  -j, --job-id    User defined id for the current job. Ex. 01")
     print("  -h, --help      Show this help message and exit")
 
 
 def parse_args():
     # Get options and arguments
-    opts, args = getopt.getopt(sys.argv[1:],"hdtnlm:e:p:",
-            ["help", "debug", "testing","mode=","no-notify","loop","email=","phone="])
+    opts, args = getopt.getopt(sys.argv[1:],"hdtnlm:e:p:j:",
+            ["help", "debug", "testing","mode=","no-notify","loop","email=","phone=","job-id="])
     for opt, arg in opts:
         if opt in ["-h","--help"]:
             global help
@@ -339,11 +352,12 @@ def parse_args():
             global debug
             debug = True
         elif opt in ["-t","--testing"]:
-            global testing
+            global testing, my_twilio_phone_number
             testing = True
+            my_twilio_phone_number = twilio_magic_number_for_testing
         elif opt in ["-n","--no-notify"]:
-            global nonotify
-            nonotify = True
+            global no_notify
+            no_notify = True
         elif opt in ["-l","--loop"]:
             global loop
             loop = True
@@ -355,21 +369,33 @@ def parse_args():
             phone_override = arg.strip()
         elif opt.strip() in ["-m", "--mode"]:
             global mode
-            mode = arg.strip()
+            if re.match('^reports?$',arg.strip().lower()):
+                mode = 'report'
+            if re.match('^notifications?$',arg.strip().lower()):
+                mode = 'notification'
+        elif opt.strip() in ["-j", "--job-id"]:
+            global job_id
+            job_id = arg.strip()
 
     if help is True:
         usage()
         sys.exit(0)
 
-    if (mode is not None
-        and not re.match('^reports?$',mode)
-        and not re.match('^notifications?$',mode)):
+    if mode is not None and mode != 'report' and mode != 'notification':
         print(f"Invalid mode value: {mode}")
         usage()
         sys.exit(1)
+    
+    global my_process_identifier # ex. server1-report-01
+    my_process_identifier = hostname
+    if mode is not None:
+        my_process_identifier += f"-{mode}"
+    if job_id is not None:
+        my_process_identifier += f"-{job_id}"
+
+
 
 if __name__ == '__main__':
     parse_args()
     if running_process_check():
         main()
-
