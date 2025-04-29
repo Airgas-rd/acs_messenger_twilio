@@ -91,12 +91,15 @@ def fetch_records():
         constraint = '"Attachment" IS NOT NULL' # Records WITH DATA in "Attachment" column
     elif mode is not None and re.match('^notifications?$',mode): #
         constraint = '"Attachment" IS NULL' # Records with NO data in "Attachment"
-
-    sql = f"""
+    
+    # Register the rows - FYI, doing an UPDATE with a NESTED SUBQUERY and a RETURNING clause 
+    # DOES NOT address the race condition yielding duplicate notifications/reports
+    # FIX - register the rows in an update (SEPARATE TRANSACTION) and do a select afterwards.
+    update = f"""
     UPDATE mail."MailQueue"
     SET processed_by = %s, attempts = attempts + 1
     WHERE "ID" IN (
-        SELECT "ID" 
+        SELECT "ID"
         FROM mail."MailQueue"
         WHERE "deliveryMethod" IS NULL -- filter out CAM messages bc they fetch via REST
         AND (
@@ -106,16 +109,19 @@ def fetch_records():
         )
         AND {constraint}
         AND attempts <= 3
+        AND pg_try_advisory_xact_lock("ID") -- Acquire a transaction-level advisory lock
         ORDER BY "ID" ASC -- FIFO
         LIMIT 10
         FOR UPDATE SKIP LOCKED
-    ) RETURNING "ID","DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment",processed_by 
+    ) RETURNING "ID","DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment",processed_by
     """
 
     params = (my_process_identifier,my_process_identifier,my_process_identifier)
 
+    # Capture the rows without commiting the transaction during testing (UPDATE with RETURNING)
+    # Use a separate SELECT query when NOT testing to address the race condition
     if debug is True:
-        q = sql
+        q = update
         for val in params:
             q = q.replace('%s',f"'{str(val)}'",1)
         print(q)
@@ -123,17 +129,18 @@ def fetch_records():
     rows = []
     try:
         cur = conn.cursor()
-        cur.execute(sql,params)
+        cur.execute(update,params)
         rows = cur.fetchall()
         if testing is True:
-            conn.rollback()
+            conn.rollback() 
         else:
             conn.commit()
     except psycopg2.Error as e:
-        print(f"Error in fetch_records: {e}")
+        print(f"Error registering rows: {e}")
     finally:
         if cur:
             cur.close()
+    
     return rows
 
 
