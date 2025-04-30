@@ -120,13 +120,13 @@ def fetch_records():
             q = q.replace('%s',f"'{str(val)}'",1)
         print(q)
 
-    # Acquire a transaction-level advisory lock before the update
+    # Acquire a session level advisory lock before the update
     rows = []
     try:
         with psycopg2.connect(**db_params, cursor_factory = DictCursor) as con:
             with con.cursor() as cur:
                 lock_query = "SELECT pg_try_advisory_lock(%s);"
-                lock_id = 4906  # Generate a unique lock ID based on the process identifier
+                lock_id = 4906  # unique lock ID
                 
                 if debug:
                     print(f"Acquiring advisory lock on lock id ({lock_id})")
