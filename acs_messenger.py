@@ -11,6 +11,7 @@ import datetime
 import time
 import json
 import platform
+import random
 from psycopg2.extras import DictCursor
 from twilio.rest import Client
 from sendgrid.helpers.mail import *
@@ -27,6 +28,10 @@ pgpassword = os.environ.get("PGPASSWORD")
 user_home = os.environ.get("HOME")
 
 db_params_filepath = f"{user_home}/scripts/db_params.json"
+
+with open(db_params_filepath) as db_params_file:
+     db_params = json.load(db_params_file)
+     db_params["password"] = pgpassword
 
 sg = None
 sms_client = None
@@ -52,7 +57,7 @@ def main():
                 result = process_record(record)
                 archive_record(record,result)
             if loop is True:
-                time.sleep(1)
+                time.sleep(random.uniform(0.5,1.5))
                 continue
             else:
                 break
@@ -70,14 +75,8 @@ def main():
 
 def initialize():
     try:
-        db_params = None
+       
         global conn, sg, sms_client
-
-        with open(db_params_filepath) as db_params_file:
-            db_params = json.load(db_params_file)
-
-        if debug is True: print(db_params)
-        db_params["password"] = pgpassword
         conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
         sg = sendgrid.SendGridAPIClient(sendgrid_api_key) # Sendgrid email client
         sms_client = Client(account_sid, auth_token) # Twilio sms client
@@ -91,10 +90,7 @@ def fetch_records():
         constraint = '"Attachment" IS NOT NULL' # Records WITH DATA in "Attachment" column
     elif mode is not None and re.match('^notifications?$',mode): #
         constraint = '"Attachment" IS NULL' # Records with NO data in "Attachment"
-    
-    # Register the rows - FYI, doing an UPDATE with a NESTED SUBQUERY and a RETURNING clause 
-    # DOES NOT address the race condition yielding duplicate notifications/reports
-    # FIX - register the rows in an update (SEPARATE TRANSACTION) and do a select afterwards.
+
     update = f"""
     UPDATE mail."MailQueue"
     SET processed_by = %s, attempts = attempts + 1
@@ -118,28 +114,45 @@ def fetch_records():
 
     params = (my_process_identifier,my_process_identifier,my_process_identifier)
 
-    # Capture the rows without commiting the transaction during testing (UPDATE with RETURNING)
-    # Use a separate SELECT query when NOT testing to address the race condition
     if debug is True:
         q = update
         for val in params:
             q = q.replace('%s',f"'{str(val)}'",1)
         print(q)
 
+    # Acquire a transaction-level advisory lock before the update
     rows = []
     try:
-        cur = conn.cursor()
-        cur.execute(update,params)
-        rows = cur.fetchall()
-        if testing is True:
-            conn.rollback() 
-        else:
-            conn.commit()
+        with psycopg2.connect(**db_params, cursor_factory = DictCursor) as con:
+            with con.cursor() as cur:
+                lock_query = "SELECT pg_try_advisory_lock(%s);"
+                lock_id = 4906  # Generate a unique lock ID based on the process identifier
+                
+                if debug:
+                    print(f"Acquiring advisory lock on lock id ({lock_id})")
+
+                cur.execute(lock_query, (lock_id,))
+                lock_acquired = cur.fetchone()[0]
+                
+                if not lock_acquired and not testing:
+                    if debug:
+                        print(f"Could not acquire advisory lock for process {my_process_identifier}. Trying again.")
+                    return rows  # Skip processing if the lock cannot be acquired
+
+                cur.execute(update,params)
+                rows = cur.fetchall()
+                if testing:
+                    conn.rollback()
+
+                unlock_query = "SELECT pg_advisory_unlock(%s);"
+                if debug:
+                    print(f"Releasing advisory lock on lock id ({lock_id})")
+                cur.execute(unlock_query, (lock_id,))
     except psycopg2.Error as e:
-        print(f"Error registering rows: {e}")
+        print(f"Error retrieving messages: {e}")
     finally:
-        if cur:
-            cur.close()
+        if con:
+            con.close()
     
     return rows
 
@@ -168,7 +181,7 @@ def send_sms(record):
         subject = record["Subject"].strip()
         body = record["Body"].strip()
         msg = None
-        if domain is not None: # It's a device
+        if domain == 'txt.att.net': # It's a device
             msg = f"SUBJ:{subject}\nMSG:{body}"
         else:
             msg = body
