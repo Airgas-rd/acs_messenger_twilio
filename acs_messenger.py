@@ -286,8 +286,8 @@ def archive_record(record,success):
         else:
             cur.execute(sql,params)
         sql = f"INSERT INTO {table}\n"
-        sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","DateSent",processed_by)\n'
-        sql += 'VALUES (%s,%s,%s,%s,%s,%s,NOW());'
+        sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
+        sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
         params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
         if debug is True:
             q = sql
