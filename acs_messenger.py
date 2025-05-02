@@ -107,7 +107,7 @@ def fetch_records():
         AND attempts <= 3
         AND pg_try_advisory_xact_lock("ID") -- Acquire a transaction-level advisory lock
         ORDER BY "ID" ASC -- FIFO
-        LIMIT 10
+        LIMIT 5
         FOR UPDATE SKIP LOCKED
     ) RETURNING "ID","DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment",processed_by
     """
