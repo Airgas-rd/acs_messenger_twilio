@@ -270,6 +270,7 @@ def archive_record(record,success):
     bcc = record["BCC_Address"]
     subject = record["Subject"]
     body = record["Body"]
+    processed_by = record["processed_by"]
     table = 'mail."MailArchive"' if success else 'mail."FailedMail"'
     try:
         cur = conn.cursor()
@@ -285,9 +286,9 @@ def archive_record(record,success):
         else:
             cur.execute(sql,params)
         sql = f"INSERT INTO {table}\n"
-        sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","DateSent")\n'
+        sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","DateSent",processed_by)\n'
         sql += 'VALUES (%s,%s,%s,%s,%s,%s,NOW());'
-        params = (destination,source,cc,bcc,subject,body) # discard attachments after sending
+        params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
         if debug is True:
             q = sql
             for val in params:
