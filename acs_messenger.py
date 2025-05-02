@@ -414,6 +414,8 @@ def parse_args():
     if job_id is not None:
         my_process_identifier += f"-{job_id}"
 
+    my_process_identifier = my_process_identifier.lower()
+
 
 
 if __name__ == '__main__':
