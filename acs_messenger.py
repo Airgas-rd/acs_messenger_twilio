@@ -75,7 +75,7 @@ def main():
 
 def initialize():
     try:
-       
+
         global conn, sg, sms_client
         conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
         sg = sendgrid.SendGridAPIClient(sendgrid_api_key) # Sendgrid email client
@@ -127,13 +127,13 @@ def fetch_records():
             with con.cursor() as cur:
                 lock_query = "SELECT pg_try_advisory_lock(%s);"
                 lock_id = 4906  # unique lock ID
-                
+
                 if debug:
                     print(f"Acquiring advisory lock on lock id ({lock_id})")
 
                 cur.execute(lock_query, (lock_id,))
                 lock_acquired = cur.fetchone()[0]
-                
+
                 if not lock_acquired and not testing:
                     if debug:
                         print(f"Could not acquire advisory lock for process {my_process_identifier}. Trying again.")
@@ -142,7 +142,9 @@ def fetch_records():
                 cur.execute(update,params)
                 rows = cur.fetchall()
                 if testing:
-                    conn.rollback()
+                    con.rollback()
+                else:
+                    con.commit()
 
                 unlock_query = "SELECT pg_advisory_unlock(%s);"
                 if debug:
@@ -153,7 +155,7 @@ def fetch_records():
     finally:
         if con:
             con.close()
-    
+
     return rows
 
 
@@ -246,9 +248,9 @@ def send_email(record):
         if no_notify is True:
                 print(f"Notifications disabled. No messages will be sent to {recipient}")
                 return True # pretend like it worked
-        
+
         response = sg.client.mail.send.post(request_body = mail.get())
-        
+
         if debug is True:
             print("Email Payload")
             pprint.pprint(mail.get(),indent=4)
@@ -309,7 +311,7 @@ def archive_record(record,success):
 def running_process_check():
     mypid = os.getpid()
     myscriptname = os.path.basename(__file__)
-    
+
     for process in psutil.process_iter(["cmdline","pid"]):
         pid = process.info["pid"]
         cmdline = process.info["cmdline"]
@@ -333,7 +335,7 @@ def running_process_check():
                         if re.match('^reports?$',other_mode):
                             other_mode = 'report'
                         elif re.match('^notifications?$',other_mode):
-                            other_mode = 'notification' 
+                            other_mode = 'notification'
                     elif parameter in ["-j","--job-id"] or re.match('--job-id=',parameter): # found job id
                         if re.match('--job-id=',parameter):
                             other_job_id = parameter.split('=')[-1]
@@ -342,8 +344,8 @@ def running_process_check():
                     if my_process_identifier == f"{hostname}-{other_mode}-{other_job_id}":
                         if debug:
                             print(f'{script} with identifier "{my_process_identifier}" found. Exiting')
-                        return False   
-                    i += 1             
+                        return False
+                    i += 1
     return True
 
 
@@ -406,7 +408,7 @@ def parse_args():
         print(f"Invalid mode value: {mode}")
         usage()
         sys.exit(1)
-    
+
     global my_process_identifier # ex. server1-report-01
     my_process_identifier = hostname
     if mode is not None:
