@@ -110,7 +110,7 @@ def fetch_records():
                     'report': 1,
                     'notification': 2
                 }.get(mode, 0)
-                lock_id = LOCK_BASE_ID + mode_offset + random.randint(0, 5) # Mode differentiation with random jitter for even more parallel safety across modes/jobs
+                lock_id = LOCK_BASE_ID + mode_offset + random.randint(0, 5) # Mode differentiation with random jitter for improved parallel safety
                 if debug_mode:
                     logging.debug(f"{my_process_identifier} - Acquiring advisory lock on lock id ({lock_id})")
                     logging.debug(cur.mogrify(lock_query, (lock_id,)).decode())
