@@ -1,97 +1,84 @@
 import os
 import re
 import psutil
-import getopt
 import sys
+import json
+import time
+import signal
+import random
+import logging
+import platform
+import base64
+import getopt
+import pprint
+import datetime
 import psycopg2
 import sendgrid
-import pprint
-import base64
-import datetime
-import time
-import json
-import platform
-import random
+
 from psycopg2.extras import DictCursor
 from twilio.rest import Client
 from sendgrid.helpers.mail import *
+from logging.handlers import TimedRotatingFileHandler
 
 my_twilio_phone_number = "+18333655808"
-twilio_magic_number_for_testing = "+15005550006" # https://www.twilio.com/docs/messaging/tutorials/automate-testing
+twilio_magic_number_for_testing = "+15005550006"
 hostname = platform.node().split('.')[0]
 
-# Values set in /etc/environment
+# Env vars set in /etc/environment
 sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
 account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 auth_token = os.environ.get("TWILIO_CLIENT_AUTH_TOKEN")
 pgpassword = os.environ.get("PGPASSWORD")
 user_home = os.environ.get("HOME")
 
-db_params_filepath = f"{user_home}/scripts/db_params.json"
+# DB config
+with open(f"{user_home}/scripts/db_params.json") as f:
+    db_params = json.load(f)
+    db_params["password"] = pgpassword
 
-with open(db_params_filepath) as db_params_file:
-     db_params = json.load(db_params_file)
-     db_params["password"] = pgpassword
-
+# Globals
 sg = None
 sms_client = None
-conn = None
-help = False
-debug = False
+should_terminate = False
+
+# CLI defaults
+debug_mode = False
 testing = False
 no_notify = False
+loop = False
+mode = None
+job_id = None
+interval = 1.0
+log_dir = None
 email_override = None
 phone_override = None
-mode = None
-loop = False
-job_id = None
+my_process_identifier = None
 
-my_process_identifier = None # Used to differentiate independent job processes - created in parse_args()
-
-def main():
-    try:
-        initialize() # set up db connection and clients
-        while True:
-            records = fetch_records()
-            for record in records:
-                result = process_record(record)
-                archive_record(record,result)
-            if loop is True:
-                time.sleep(random.uniform(0.5,1.5))
-                continue
-            else:
-                break
-    except getopt.GetoptError as e:
-        print(e)
-        usage()
-    except psycopg2.Error as e:
-        print(e)
-    except Exception as e:
-        print(e)
-    finally:
-        if conn:
-            conn.close()
+# Constants
+FETCH_LIMIT = 5
+MAX_ATTEMPTS = 3
+MAX_AGE = 15
+LOCK_BASE_ID = 4906
 
 
-def initialize():
-    try:
+def shutdown(signum, frame):
+    global should_terminate
+    logging.info(f"Received signal {signum}. Shutting down...")
+    should_terminate = True
 
-        global conn, sg, sms_client
-        conn = psycopg2.connect(**db_params, cursor_factory = DictCursor)
-        sg = sendgrid.SendGridAPIClient(sendgrid_api_key) # Sendgrid email client
-        sms_client = Client(account_sid, auth_token) # Twilio sms client
-    except Exception as e:
-        raise Exception(e)
+
+signal.signal(signal.SIGINT, shutdown)
+signal.signal(signal.SIGTERM, shutdown)
 
 
 def fetch_records():
     constraint = "TRUE" # Gets all records
-    if mode is not None and re.match('^reports?$',mode):
+    if mode == 'report':
         constraint = '"Attachment" IS NOT NULL' # Records WITH DATA in "Attachment" column
-    elif mode is not None and re.match('^notifications?$',mode): #
+    elif mode == 'notification': #
         constraint = '"Attachment" IS NULL' # Records with NO data in "Attachment"
 
-    update = f"""
+    update_sql = f"""
     UPDATE mail."MailQueue"
     SET processed_by = %s, attempts = attempts + 1
     WHERE "ID" IN (
@@ -101,60 +88,62 @@ def fetch_records():
         AND (
             processed_by IS NULL -- record is available for processing
             OR processed_by = %s -- previously attempted but failed for some reason
-            OR (processed_by <> %s AND created_at < NOW() - '15 minutes'::interval) -- previously attempted by another process that died or is falling behind
+            OR (processed_by <> %s AND created_at < NOW() - '{MAX_AGE} minutes'::interval) -- previously attempted by another process that died or is falling behind
         )
         AND {constraint}
-        AND attempts <= 3
+        AND attempts <= {MAX_ATTEMPTS}
         AND pg_try_advisory_xact_lock("ID") -- Acquire a transaction-level advisory lock
         ORDER BY "ID" ASC -- FIFO
-        LIMIT 5
+        LIMIT {FETCH_LIMIT}
         FOR UPDATE SKIP LOCKED
     ) RETURNING "ID","DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment",processed_by
     """
 
-    params = (my_process_identifier,my_process_identifier,my_process_identifier)
-
-    if debug is True:
-        q = update
-        for val in params:
-            q = q.replace('%s',f"'{str(val)}'",1)
-        print(q)
-
-    # Acquire a session level advisory lock before the update
+    # Acquire a session-level advisory lock to avoid duplicate fetchers
+    lock_acquired = False
     rows = []
     try:
-        with psycopg2.connect(**db_params, cursor_factory = DictCursor) as con:
-            with con.cursor() as cur:
+        with psycopg2.connect(**db_params, cursor_factory = DictCursor) as conn:
+            with conn.cursor() as cur:
                 lock_query = "SELECT pg_try_advisory_lock(%s);"
-                lock_id = 4906  # unique lock ID
-
-                if debug:
-                    print(f"Acquiring advisory lock on lock id ({lock_id})")
+                mode_offset = {
+                    'report': 1,
+                    'notification': 2
+                }.get(mode, 0)
+                lock_id = LOCK_BASE_ID + mode_offset + random.randint(0, 5) # Mode differentiation with random jitter for even more parallel safety across modes/jobs
+                if debug_mode:
+                    logging.debug(f"{my_process_identifier} - Acquiring advisory lock on lock id ({lock_id})")
+                    logging.debug(cur.mogrify(lock_query, (lock_id,)).decode())
 
                 cur.execute(lock_query, (lock_id,))
                 lock_acquired = cur.fetchone()[0]
 
                 if not lock_acquired and not testing:
-                    if debug:
-                        print(f"Could not acquire advisory lock for process {my_process_identifier}. Trying again.")
-                    return rows  # Skip processing if the lock cannot be acquired
+                    if debug_mode:
+                        logging.debug(f"{my_process_identifier} - Could not acquire advisory lock ({lock_id}). Trying again.")
+                    return []  # Skip processing if the lock cannot be acquired
 
-                cur.execute(update,params)
+                params = (my_process_identifier,) * 3
+                if debug_mode:
+                    logging.debug(cur.mogrify(update_sql,params).decode())
+                cur.execute(update_sql,params)
                 rows = cur.fetchall()
                 if testing:
-                    con.rollback()
+                    conn.rollback()
                 else:
-                    con.commit()
-
-                unlock_query = "SELECT pg_advisory_unlock(%s);"
-                if debug:
-                    print(f"Releasing advisory lock on lock id ({lock_id})")
-                cur.execute(unlock_query, (lock_id,))
+                    conn.commit()
     except psycopg2.Error as e:
-        print(f"Error retrieving messages: {e}")
+        logging.error(f"Error retrieving messages: {e}")
+    except Exception as e:
+        logging.exception(f"Unexpected error: {e}")
     finally:
-        if con:
-            con.close()
+        if lock_acquired:
+            unlock_query = "SELECT pg_advisory_unlock(%s);"
+            if debug_mode:
+                logging.debug(f"{my_process_identifier} - Releasing advisory lock on lock id ({lock_id})")
+                logging.debug(cur.mogrify(unlock_query, (lock_id,)).decode())
+            with conn.cursor() as c:
+                c.execute(unlock_query, (lock_id,))
 
     return rows
 
@@ -163,10 +152,10 @@ def process_record(record):
     destination = record["DestinationAddress"]
     target = destination.strip().split('@')[0]
     if len(destination) < 6 or len(target) < 1: # a@b.me -> anything shorter is prob bogus
-        print(f"Invalid destination address: {destination}")
+        logging.error(f"Invalid destination address: {destination}")
         return False
     result = None
-    if re.search("^\\d{10}",target): # assume phone number
+    if re.fullmatch(r"\d{10}", target): # phone number
         result = send_sms(record)
     else:                            # assume email
         result = send_email(record)
@@ -189,30 +178,32 @@ def send_sms(record):
             msg = body
 
         if no_notify is True:
-            print(f"Notifications disabled. No messages will be sent to {target_phone_number}")
+            logging.debug(f"Notifications disabled. No messages will be sent to {target_phone_number}")
             return True # pretend like it worked
         message = sms_client.messages.create(
             to = target_phone_number,  # Replace with the recipient"s phone number
             from_ = my_twilio_phone_number,  # Replace with your Twilio phone number
             body = msg,
         )
-        if debug is True:
-            print(f"Message to {target_phone_number}")
-            print(f"Body: {msg}")
-            print(f"Status: {message.status}")
+        if debug_mode:
+            logging.debug(f"Message to {target_phone_number}")
+            logging.debug(f"Body: {msg}")
+            logging.debug(f"Status: {message.status}")
         if message.error_code:
             raise Exception(f"SMS error {message.error_code} {message.error_message}")
     except Exception as e:
-        print("Error in send_sms: {e}")
+        logging.exception(f"Error in send_sms: {e}")
         return False
     return True
-
 
 def send_email(record):
     try:
         if email_override:
             record["DestinationAddress"] = email_override
         recipient = record["DestinationAddress"]
+        if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", recipient):
+            logging.error(f"Malformed email address: {recipient}")
+            return False
         sender = record["SourceAddress"]
         sender = 'bamsupport@airgas-rd.com' # override until mail.airgas-rd.com is validated with twilio
         mail = Mail(
@@ -223,20 +214,24 @@ def send_email(record):
         personalization = Personalization()
         personalization.add_to(To(recipient))
         if record["CC_Address"] is not None and len(record["CC_Address"].strip().split(',')) > 0:
-            list = record["CC_Address"].strip().split(',')
-            for cc in list:
+            cc_list = record["CC_Address"].strip().split(',')
+            for cc in cc_list:
                 val = cc.strip()
-                if len(val) < 6: continue # a@b.me -> anything shorter is prob bogus
+                if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+",val):
+                    logging.error(f"Ignoring malformed CC recipient ({val})")
+                    continue
                 personalization.add_cc(Cc(val))
         if record["BCC_Address"] is not None and len(record["BCC_Address"].strip().split(',')) > 0:
-            list = record["BCC_Address"].strip().split(',')
-            for bcc in list:
+            bcc_list = record["BCC_Address"].strip().split(',')
+            for bcc in bcc_list:
                 val = bcc.strip()
-                if len(val) < 6: continue # a@b.me -> anything shorter is prob bogus
+                if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+",val):
+                    logging.error(f"Ignoring malformed BCC recipient ({val})")
+                    continue
                 personalization.add_bcc(Bcc(val))
         mail.add_personalization(personalization)
-        if  record["Attachment"] is not None: # Arbitrary threshold for the number of bytes until we can check for null value in Attachment
-            basename = re.sub("\\s+","_",record["Subject"].strip().lower()) # acs_report_name
+        if record["Attachment"] and len(record["Attachment"]) > 0:
+            basename = re.sub(r'[^\w\-_.]', '_', record["Subject"].strip().lower()) # acs_report_name
             suffix = datetime.datetime.now(datetime.timezone.utc).strftime("_%Y_%m_%d_%H_%M_%S.csv")
             name = basename + suffix # acs_report_name_YYYY_mm_dd_HH_MM_SS.csv
             file_name = FileName(name)
@@ -246,23 +241,22 @@ def send_email(record):
             attachment = Attachment(file_content,file_name,file_type,disposition)
             mail.add_attachment(attachment)
         if no_notify is True:
-                print(f"Notifications disabled. No messages will be sent to {recipient}")
-                return True # pretend like it worked
+            logging.debug(f"Notifications disabled. No messages will be sent to {recipient}")
+            return True # pretend like it worked
 
         response = sg.client.mail.send.post(request_body = mail.get())
 
-        if debug is True:
-            print("Email Payload")
-            pprint.pprint(mail.get(),indent=4)
-            print(f"Email response code: {response.status_code}")
+        if debug_mode:
+            logging.debug("Email Payload")
+            pprint.pprint(mail.get(), indent=4)
+            logging.debug(f"Email response code: {response.status_code}")
         if response.status_code < 200 or response.status_code > 204:
-            print(response.to_dict)
+            logging.debug(response.to_dict)
             raise Exception(f"Email request failed with code {response.status_code}")
     except Exception as e:
-        print(f"Error in send_email: {e}")
+        logging.exception(f"Error in send_email: {e}")
         return False
     return True
-
 
 def archive_record(record,success):
     id = record["ID"]
@@ -274,41 +268,42 @@ def archive_record(record,success):
     body = record["Body"]
     processed_by = record["processed_by"]
     table = 'mail."MailArchive"' if success else 'mail."FailedMail"'
+    cur = None
     try:
-        cur = conn.cursor()
-        sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
-        params = (id,)
-        if debug is True:
-            q = sql
-            for val in params:
-                q = q.replace('%s',f"'{str(val)}'",1)
-            print(q)
-        if testing:
-            print("Test mode enabled. No changes made")
-        else:
-            cur.execute(sql,params)
-        sql = f"INSERT INTO {table}\n"
-        sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
-        sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
-        params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
-        if debug is True:
-            q = sql
-            for val in params:
-                q = q.replace('%s',f"'{str(val)}'",1)
-            print(q)
-        if testing:
-            print("Test mode enabled. No changes made")
-        else:
-            cur.execute(sql,params)
-            conn.commit()
+        with psycopg2.connect(**db_params, cursor_factory = DictCursor) as conn:
+            with conn.cursor() as cur:
+                delete_sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
+                params = (id,)
+
+                if debug_mode:
+                    logging.debug(cur.mogrify(delete_sql,params).decode())
+
+                if testing:
+                    logging.debug("Test mode enabled. No changes made")
+                else:
+                    cur.execute(delete_sql,params)
+
+                insert_sql = f"INSERT INTO {table}\n"
+                insert_sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
+                insert_sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
+                params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
+
+                if debug_mode:
+                    logging.debug(cur.mogrify(insert_sql,params).decode())
+
+                if testing:
+                    logging.debug("Test mode enabled. No changes made")
+                else:
+                    cur.execute(insert_sql,params)
+                    conn.commit()
     except psycopg2.Error as e:
-        print(f"Error in archive_record: {e}")
-    finally:
-        if cur:
-            cur.close()
+        logging.error(f"Error in archive_record: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error in archive_record: {e}")
 
 
 def running_process_check():
+    global my_process_identifier
     mypid = os.getpid()
     myscriptname = os.path.basename(__file__)
 
@@ -328,99 +323,142 @@ def running_process_check():
                     parameter = args[i]
                     if parameter in ["-m","--mode"] or re.match('--mode=',parameter): # found mode
                         if re.match('--mode=',parameter): # long format --key=value
-                            other_mode = parameter.split('=')[-1]
+                            other_mode = parameter.split('=')[-1].rstrip('s')
                         else: # short format -k 'v'
-                            other_mode = args[i]
+                            other_mode = args[i].rstrip('s')
 
-                        if re.match('^reports?$',other_mode):
-                            other_mode = 'report'
-                        elif re.match('^notifications?$',other_mode):
-                            other_mode = 'notification'
                     elif parameter in ["-j","--job-id"] or re.match('--job-id=',parameter): # found job id
                         if re.match('--job-id=',parameter):
                             other_job_id = parameter.split('=')[-1]
                         else:
                              other_job_id = args[i]
                     if my_process_identifier == f"{hostname}-{other_mode}-{other_job_id}":
-                        if debug:
-                            print(f'{script} with identifier "{my_process_identifier}" found. Exiting')
+                        if debug_mode:
+                            logging.debug(f'{script} with identifier "{my_process_identifier}" found. Exiting')
                         return False
                     i += 1
     return True
 
-
-def usage():
-    print("Usage: acs_messenger.py [options] [arguments]")
-    print("Options:")
-    print("  -m, --mode      report | notification DEFAULT (send both)")
-    print("  -l, --loop      Script run perpetually - polls DB every second for new records")
-    print("  -d, --debug     Show SQL queries")
-    print("  -t, --testing   No database changes made")
-    print("  -n, --no-notify No sms or email sent - useful for testing")
-    print("  -e, --email     Override email recipient - useful for testing")
-    print("  -p, --phone     Override sms/text recipient - useful for testing")
-    print("  -j, --job-id    User defined id for the current job. Ex. 01")
-    print("  -h, --help      Show this help message and exit")
-
+def print_usage():
+    print("""
+Usage: acs_messenger.py [options] [arguments]
+Options:
+  -m, --mode        report | notification (default: all)
+  -l, --loop        Run continuously (polls DB every second)
+  -d, --debug       Enable debug output
+  -t, --testing     Dry run (no DB changes)
+  -n, --no-notify   Skip sending SMS or email
+  -e, --email       Override email recipient
+  -p, --phone       Override SMS recipient
+  -j, --job-id      Custom job identifier
+  -i, --interval    Polling interval (seconds)
+  -L, --log-dir     Custom log directory
+  -h, --help        Show this help message and exit
+""")
 
 def parse_args():
-    # Get options and arguments
-    opts, args = getopt.getopt(sys.argv[1:],"hdtnlm:e:p:j:",
-            ["help", "debug", "testing","mode=","no-notify","loop","email=","phone=","job-id="])
-    for opt, arg in opts:
-        if opt in ["-h","--help"]:
-            global help
-            help = True
-        elif opt in ["-d","--debug"]:
-            global debug
-            debug = True
-        elif opt in ["-t","--testing"]:
-            global testing, my_twilio_phone_number
-            testing = True
-            my_twilio_phone_number = twilio_magic_number_for_testing
-        elif opt in ["-n","--no-notify"]:
-            global no_notify
-            no_notify = True
-        elif opt in ["-l","--loop"]:
-            global loop
-            loop = True
-        elif opt.strip() in ["-e","--email"]:
-            global email_override
-            email_override = arg.strip()
-        elif opt.strip() in ["-p","--phone"]:
-            global phone_override
-            phone_override = arg.strip()
-        elif opt.strip() in ["-m", "--mode"]:
-            global mode
-            if re.match('^reports?$',arg.strip().lower()):
-                mode = 'report'
-            if re.match('^notifications?$',arg.strip().lower()):
-                mode = 'notification'
-        elif opt.strip() in ["-j", "--job-id"]:
-            global job_id
-            job_id = arg.strip()
+    global mode, loop, debug_mode, testing, no_notify, email_override
+    global phone_override, job_id, interval, log_dir, my_process_identifier
 
-    if help is True:
-        usage()
-        sys.exit(0)
-
-    if mode is not None and mode != 'report' and mode != 'notification':
-        print(f"Invalid mode value: {mode}")
-        usage()
+    try:
+        opts, _ = getopt.getopt(sys.argv[1:], "hdtnlm:e:p:j:i:L:", [
+            "help", "debug", "testing", "mode=", "no-notify", "loop",
+            "email=", "phone=", "job-id=", "interval=", "log-dir="
+        ])
+        for opt, arg in opts:
+            if opt in ["-h", "--help"]:
+                print_usage()
+                sys.exit(0)
+            elif opt in ["-d", "--debug"]:
+                debug_mode = True
+            elif opt in ["-t", "--testing"]:
+                testing = True
+            elif opt in ["-n", "--no-notify"]:
+                no_notify = True
+            elif opt in ["-l", "--loop"]:
+                loop = True
+            elif opt in ["-e", "--email"]:
+                email_override = arg.strip()
+            elif opt in ["-p", "--phone"]:
+                phone_override = twilio_magic_number_for_testing if arg.strip().lower() == 'twilio' else arg.strip()
+            elif opt in ["-m", "--mode"]:
+                mode = re.sub(r's$', '', arg.strip().lower())
+            elif opt in ["-j", "--job-id"]:
+                job_id = arg.strip()
+            elif opt in ["-i", "--interval"]:
+                interval = float(arg.strip())
+            elif opt in ["-L", "--log-dir"]:
+                log_dir = os.path.abspath(arg.strip())
+    except getopt.GetoptError as e:
+        print(e, file=sys.stderr)
+        print_usage()
         sys.exit(1)
 
-    global my_process_identifier # ex. server1-report-01
-    my_process_identifier = hostname
-    if mode is not None:
-        my_process_identifier += f"-{mode}"
-    if job_id is not None:
-        my_process_identifier += f"-{job_id}"
+    if mode not in (None, 'report', 'notification'):
+        logging.error(f"Invalid mode value: {mode}")
+        print_usage()
+        sys.exit(1)
 
+    my_process_identifier = hostname
+    if mode:
+        my_process_identifier += f"-{mode}"
+    if job_id:
+        my_process_identifier += f"-{job_id}"
     my_process_identifier = my_process_identifier.lower()
 
+def initialize_logs():
+    global log_dir,my_process_identifier
+    try:
+        log_dir = log_dir if log_dir else os.path.join(os.getcwd(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_name = f"{my_process_identifier}.log"
+        log_file = os.path.join(log_dir, file_name)
 
+        file_handler = TimedRotatingFileHandler(
+            filename=log_file,
+            when="midnight",
+            interval=1,
+            backupCount=7
+        )
 
-if __name__ == '__main__':
+        handlers = [file_handler]
+
+        if debug_mode:
+            stream_handler = logging.StreamHandler(sys.stdout)
+            handlers.append(stream_handler)
+
+        logging.basicConfig(
+            level=logging.DEBUG if debug_mode else logging.INFO,
+            format='%(asctime)s %(levelname)s [%(process)d] %(message)s',
+            handlers=handlers
+        )
+    except Exception as e:
+        print(f"Failed to initialize logging: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def initialize_clients():
+    global sg, sms_client
+    sg = sendgrid.SendGridAPIClient(sendgrid_api_key)
+    sms_client = Client(account_sid, auth_token)
+
+def run_worker_loop():
+    while not should_terminate:
+        records = fetch_records()
+        if not records:
+            time.sleep(interval * random.uniform(0.8, 1.2))
+            continue
+        for record in records:
+            success = process_record(record)
+            archive_record(record, success)
+        if not loop:
+            break
+
+def main():
     parse_args()
     if running_process_check():
-        main()
+        initialize_logs()
+        initialize_clients()
+        run_worker_loop()
+
+if __name__ == '__main__':
+    main()
