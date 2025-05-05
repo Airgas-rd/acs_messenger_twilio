@@ -60,16 +60,13 @@ MAX_ATTEMPTS = 3
 MAX_AGE = 15
 LOCK_BASE_ID = 4906
 
-
 def shutdown(signum, frame):
     global should_terminate
     logging.info(f"Received signal {signum}. Shutting down...")
     should_terminate = True
 
-
 signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
-
 
 def fetch_records():
     constraint = "TRUE" # Gets all records
@@ -147,7 +144,6 @@ def fetch_records():
 
     return rows
 
-
 def process_record(record):
     destination = record["DestinationAddress"]
     target = destination.strip().split('@')[0]
@@ -160,7 +156,6 @@ def process_record(record):
     else:                            # assume email
         result = send_email(record)
     return result
-
 
 def send_sms(record):
     try:
@@ -300,7 +295,6 @@ def archive_record(record,success):
         logging.error(f"Error in archive_record: {e}")
     except Exception as e:
         logging.error(f"Unexpected error in archive_record: {e}")
-
 
 def running_process_check():
     global my_process_identifier
