@@ -141,7 +141,6 @@ def fetch_records():
                 logging.debug(cur.mogrify(unlock_query, (lock_id,)).decode())
             with conn.cursor() as c:
                 c.execute(unlock_query, (lock_id,))
-
     return rows
 
 def process_record(record):
