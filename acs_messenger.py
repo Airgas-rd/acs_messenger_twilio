@@ -403,7 +403,10 @@ def parse_args():
 def initialize_logs():
     global log_dir,my_process_identifier
     try:
-        log_dir = log_dir if log_dir else os.path.join(os.getcwd(), "logs")
+        if log_dir is None:
+            current_file_path = __file__ # Special variable holding the path of the current file
+            parent_dir_current = os.path.dirname(current_file_path)
+            log_dir = os.path.join(parent_dir_current,"logs")
         os.makedirs(log_dir, exist_ok=True)
         file_name = f"{my_process_identifier}.log"
         log_file = os.path.join(log_dir, file_name)
