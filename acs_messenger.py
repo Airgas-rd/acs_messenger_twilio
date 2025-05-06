@@ -69,62 +69,71 @@ signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
 def fetch_records():
-    constraint = "TRUE" # Gets all records
+    constraint = "TRUE"  # Gets all records
     if mode == 'report':
-        constraint = '"Attachment" IS NOT NULL' # Records WITH DATA in "Attachment" column
-    elif mode == 'notification': #
-        constraint = '"Attachment" IS NULL' # Records with NO data in "Attachment"
+        constraint = '"Attachment" IS NOT NULL'
+    elif mode == 'notification':
+        constraint = '"Attachment" IS NULL'
 
-    update_sql = f"""
-    UPDATE mail."MailQueue"
-    SET processed_by = %s, attempts = attempts + 1
-    WHERE "ID" IN (
-        SELECT "ID"
-        FROM mail."MailQueue"
-        WHERE "deliveryMethod" IS NULL -- filter out CAM messages bc they fetch via REST
-        AND (
-            processed_by IS NULL -- record is available for processing
-            OR processed_by = %s -- previously attempted but failed for some reason
-            OR (processed_by <> %s AND created_at < NOW() - '{MAX_AGE} minutes'::interval) -- previously attempted by another process that died or is falling behind
-        )
-        AND {constraint}
-        AND attempts <= {MAX_ATTEMPTS}
-        AND pg_try_advisory_xact_lock("ID") -- Acquire a transaction-level advisory lock
-        ORDER BY "ID" ASC -- FIFO
-        LIMIT {FETCH_LIMIT}
-        FOR UPDATE SKIP LOCKED
-    ) RETURNING "ID","DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body","Attachment",processed_by
+    select_sql = f"""
+    SELECT "ID"
+    FROM mail."MailQueue"
+    WHERE "deliveryMethod" IS NULL
+      AND (
+          processed_by IS NULL OR
+          processed_by = %s OR
+          (processed_by <> %s AND created_at < NOW() - '{MAX_AGE} minutes'::interval)
+      )
+      AND {constraint}
+      AND attempts <= {MAX_ATTEMPTS}
+    ORDER BY "ID" ASC
+    LIMIT {FETCH_LIMIT}
+    FOR UPDATE SKIP LOCKED
     """
 
-    # Acquire a session-level advisory lock to avoid duplicate fetchers
-    lock_acquired = False
-    rows = []
-    try:
-        with psycopg2.connect(**db_params, cursor_factory = DictCursor) as conn:
-            with conn.cursor() as cur:
-                lock_query = "SELECT pg_try_advisory_lock(%s);"
-                mode_offset = {
-                    'report': 1,
-                    'notification': 2
-                }.get(mode, 0)
-                lock_id = LOCK_BASE_ID + mode_offset
-                if debug_mode:
-                    logging.debug(f"{my_process_identifier} - Acquiring advisory lock on lock id ({lock_id})")
-                    logging.debug(cur.mogrify(lock_query, (lock_id,)).decode())
+    update_sql = """
+    UPDATE mail."MailQueue"
+    SET processed_by = %s, attempts = attempts + 1
+    WHERE "ID" = %s
+    RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", processed_by
+    """
 
-                cur.execute(lock_query, (lock_id,))
+    # Advisory lock per mode (report/notification)
+    mode_offset = {'report': 1, 'notification': 2}.get(mode, 0)
+    lock_id = LOCK_BASE_ID + mode_offset
+    lock_acquired = False
+    claimed_rows = []
+
+    try:
+        with psycopg2.connect(**db_params, cursor_factory=DictCursor) as conn:
+            with conn.cursor() as cur:
+                # Acquire session-level advisory lock (optional, still useful)
+                cur.execute("SELECT pg_try_advisory_lock(%s);", (lock_id,))
                 lock_acquired = cur.fetchone()[0]
 
                 if not lock_acquired and not testing:
                     if debug_mode:
-                        logging.debug(f"{my_process_identifier} - Could not acquire advisory lock ({lock_id}). Trying again.")
-                    return []  # Skip processing if the lock cannot be acquired
+                        logging.debug(f"{my_process_identifier} - Could not acquire advisory lock ({lock_id}). Skipping.")
+                    return []
 
-                params = (my_process_identifier,) * 3
                 if debug_mode:
-                    logging.debug(cur.mogrify(update_sql,params).decode())
-                cur.execute(update_sql,params)
+                    logging.debug(cur.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
+
+                cur.execute(select_sql, (my_process_identifier, my_process_identifier))
                 rows = cur.fetchall()
+
+                lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
+                for row in rows:
+                    cur.execute(lock_query, (row["ID"],))
+                    if debug_mode:
+                        logging.debug(cur.mogrify(lock_query, (row["ID"],)).decode())
+                    if cur.fetchone()[0]:  # Lock acquired
+                        if debug_mode:
+                            logging.debug(cur.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+                        cur.execute(update_sql, (my_process_identifier, row["ID"]))
+                        record = cur.fetchone()
+                        claimed_rows.append(record)
+
                 if testing:
                     conn.rollback()
                 else:
@@ -136,12 +145,16 @@ def fetch_records():
     finally:
         if lock_acquired:
             unlock_query = "SELECT pg_advisory_unlock(%s);"
-            if debug_mode:
-                logging.debug(f"{my_process_identifier} - Releasing advisory lock on lock id ({lock_id})")
-                logging.debug(cur.mogrify(unlock_query, (lock_id,)).decode())
-            with conn.cursor() as c:
-                c.execute(unlock_query, (lock_id,))
-    return rows
+            try:
+                with psycopg2.connect(**db_params) as conn:
+                    with conn.cursor() as cur:
+                        if debug_mode:
+                            logging.debug(cur.mogrify(unlock_query, (lock_id,)).decode())
+                        cur.execute(unlock_query, (lock_id,))
+            except Exception as e:
+                logging.warning(f"Failed to release advisory lock: {e}")
+
+    return claimed_rows
 
 def process_record(record):
     destination = record["DestinationAddress"]
