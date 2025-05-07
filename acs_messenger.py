@@ -59,6 +59,7 @@ FETCH_LIMIT = 5
 MAX_ATTEMPTS = 3
 MAX_AGE = 15
 LOCK_BASE_ID = 4906
+ROW_LOCK_NAMESPACE = 91784  # Arbitrary hardcoded namespace for row-level locks
 
 def shutdown(signum, frame):
     global should_terminate
@@ -117,11 +118,11 @@ def fetch_records():
                 cur.execute(select_sql, (my_process_identifier, my_process_identifier))
                 rows = cur.fetchall()
 
-                lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
+                lock_query = "SELECT pg_try_advisory_xact_lock(%s,%s);"
                 for row in rows:
-                    cur.execute(lock_query, (row["ID"],))
+                    cur.execute(lock_query, (ROW_LOCK_NAMESPACE,row["ID"]))
                     if debug_mode:
-                        logging.debug(cur.mogrify(lock_query, (row["ID"],)).decode())
+                        logging.debug(cur.mogrify(lock_query, (ROW_LOCK_NAMESPACE,row["ID"])).decode())
                     if cur.fetchone()[0]:  # Lock acquired
                         update_filter = None
                         if row["processed_by"] is None:
@@ -466,9 +467,19 @@ def run_worker_loop():
         if not records:
             time.sleep(interval * random.uniform(0.8, 1.2))
             continue
+        processed_count = 0
+        failed_count = 0
         for record in records:
+            if debug_mode:
+                logging.debug(f"Processing record ID: {record['ID']}")
             success = process_record(record)
             archive_record(record, success)
+            if success:
+                processed_count += 1
+            if not success:
+                failed_count += 1
+        if debug_mode:
+            logging.debug(f"Batch complete. Processed: {processed_count}, Failed: {failed_count}")
         if not loop:
             break
 
