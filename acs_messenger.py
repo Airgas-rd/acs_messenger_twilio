@@ -76,7 +76,7 @@ def fetch_records():
         constraint = '"Attachment" IS NULL'
 
     select_sql = f"""
-    SELECT "ID"
+    SELECT "ID", processed_by
     FROM mail."MailQueue"
     WHERE "deliveryMethod" IS NULL
       AND (
@@ -89,13 +89,6 @@ def fetch_records():
     ORDER BY "ID" ASC
     LIMIT {FETCH_LIMIT}
     FOR UPDATE SKIP LOCKED
-    """
-
-    update_sql = """
-    UPDATE mail."MailQueue"
-    SET processed_by = %s, attempts = attempts + 1
-    WHERE "ID" = %s
-    RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", processed_by
     """
 
     # Advisory lock per mode (report/notification)
@@ -111,10 +104,12 @@ def fetch_records():
                 cur.execute("SELECT pg_try_advisory_lock(%s);", (lock_id,))
                 lock_acquired = cur.fetchone()[0]
 
-                if not lock_acquired and not testing:
-                    if debug_mode:
-                        logging.debug(f"{my_process_identifier} - Could not acquire advisory lock ({lock_id}). Skipping.")
-                    return []
+                if not lock_acquired:
+                    if testing:
+                        logging.warning("Proceeding in testing mode without advisory lock.")
+                    else:
+                        logging.error("Could not acquire advisory lock. Exiting to avoid duplicate processing.")
+                        return []
 
                 if debug_mode:
                     logging.debug(cur.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
@@ -128,11 +123,26 @@ def fetch_records():
                     if debug_mode:
                         logging.debug(cur.mogrify(lock_query, (row["ID"],)).decode())
                     if cur.fetchone()[0]:  # Lock acquired
+                        update_filter = None
+                        if row["processed_by"] is None:
+                            update_filter = "processed_by IS NULL"
+                        else:
+                            update_filter = f"""processed_by = '{row["processed_by"]}'"""
+
+                        update_sql = f"""
+                        UPDATE mail."MailQueue"
+                        SET processed_by = %s, attempts = attempts + 1
+                        WHERE "ID" = %s
+                        AND {update_filter} -- The processed_by ensures the row is still in the same state from the select
+                        RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", processed_by
+                        """
+
                         if debug_mode:
                             logging.debug(cur.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
                         cur.execute(update_sql, (my_process_identifier, row["ID"]))
                         record = cur.fetchone()
-                        claimed_rows.append(record)
+                        if record:
+                            claimed_rows.append(record)
 
                 if testing:
                     conn.rollback()
