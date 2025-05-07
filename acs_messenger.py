@@ -58,7 +58,6 @@ my_process_identifier = None
 FETCH_LIMIT = 5
 MAX_ATTEMPTS = 3
 MAX_AGE = 15
-LOCK_BASE_ID = 4906
 ROW_LOCK_NAMESPACE = 91784  # Arbitrary hardcoded namespace for row-level locks
 
 def shutdown(signum, frame):
@@ -92,26 +91,10 @@ def fetch_records():
     FOR UPDATE SKIP LOCKED
     """
 
-    # Advisory lock per mode (report/notification)
-    mode_offset = {'report': 1, 'notification': 2}.get(mode, 0)
-    lock_id = LOCK_BASE_ID + mode_offset
-    lock_acquired = False
     claimed_rows = []
-
     try:
         with psycopg2.connect(**db_params, cursor_factory=DictCursor) as conn:
             with conn.cursor() as cur:
-                # Acquire session-level advisory lock (optional, still useful)
-                cur.execute("SELECT pg_try_advisory_lock(%s);", (lock_id,))
-                lock_acquired = cur.fetchone()[0]
-
-                if not lock_acquired:
-                    if testing:
-                        logging.warning("Proceeding in testing mode without advisory lock.")
-                    else:
-                        logging.error("Could not acquire advisory lock. Exiting to avoid duplicate processing.")
-                        return []
-
                 if debug_mode:
                     logging.debug(cur.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
 
@@ -153,17 +136,6 @@ def fetch_records():
         logging.error(f"Error retrieving messages: {e}")
     except Exception as e:
         logging.exception(f"Unexpected error: {e}")
-    finally:
-        if lock_acquired:
-            unlock_query = "SELECT pg_advisory_unlock(%s);"
-            try:
-                with psycopg2.connect(**db_params) as conn:
-                    with conn.cursor() as cur:
-                        if debug_mode:
-                            logging.debug(cur.mogrify(unlock_query, (lock_id,)).decode())
-                        cur.execute(unlock_query, (lock_id,))
-            except Exception as e:
-                logging.warning(f"Failed to release advisory lock: {e}")
 
     return claimed_rows
 
@@ -464,9 +436,6 @@ def initialize_clients():
 def run_worker_loop():
     while not should_terminate:
         records = fetch_records()
-        if not records:
-            time.sleep(interval * random.uniform(0.8, 1.2))
-            continue
         processed_count = 0
         failed_count = 0
         for record in records:
@@ -482,6 +451,8 @@ def run_worker_loop():
             logging.debug(f"Batch complete. Processed: {processed_count}, Failed: {failed_count}")
         if not loop:
             break
+        time.sleep(interval * random.uniform(0.8, 1.2)) # Don't hammer the DB
+
 
 def main():
     parse_args()
