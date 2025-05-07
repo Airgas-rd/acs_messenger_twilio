@@ -447,12 +447,11 @@ def run_worker_loop():
                 processed_count += 1
             if not success:
                 failed_count += 1
-        if debug_mode:
+        if debug_mode and records:
             logging.debug(f"Batch complete. Processed: {processed_count}, Failed: {failed_count}")
         if not loop:
             break
         time.sleep(interval * random.uniform(0.8, 1.2)) # Don't hammer the DB
-
 
 def main():
     parse_args()
