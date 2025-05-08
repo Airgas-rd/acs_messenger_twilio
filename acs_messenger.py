@@ -84,6 +84,7 @@ def fetch_records():
           processed_by = %s OR
           (processed_by <> %s AND created_at < NOW() - '{MAX_AGE} minutes'::interval)
       )
+      AND pg_try_advisory_xact_lock("ID")
       AND {constraint}
       AND attempts <= {MAX_ATTEMPTS}
     ORDER BY "ID" ASC
@@ -101,32 +102,41 @@ def fetch_records():
                 cur.execute(select_sql, (my_process_identifier, my_process_identifier))
                 rows = cur.fetchall()
 
-                lock_query = "SELECT pg_try_advisory_xact_lock(%s,%s);"
+                lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
                 for row in rows:
-                    cur.execute(lock_query, (ROW_LOCK_NAMESPACE,row["ID"]))
                     if debug_mode:
-                        logging.debug(cur.mogrify(lock_query, (ROW_LOCK_NAMESPACE,row["ID"])).decode())
-                    if cur.fetchone()[0]:  # Lock acquired
-                        update_filter = None
-                        if row["processed_by"] is None:
-                            update_filter = "processed_by IS NULL"
-                        else:
-                            update_filter = f"""processed_by = '{row["processed_by"]}'"""
-
-                        update_sql = f"""
-                        UPDATE mail."MailQueue"
-                        SET processed_by = %s, attempts = attempts + 1
-                        WHERE "ID" = %s
-                        AND {update_filter} -- The processed_by ensures the row is still in the same state from the select
-                        RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", processed_by
-                        """
-
+                        logging.debug(cur.mogrify(lock_query, (row["ID"],)).decode())
+                    cur.execute(lock_query, (row["ID"],))
+                    if not cur.fetchone()[0]: # lock not acquired for the row
                         if debug_mode:
-                            logging.debug(cur.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+                            logging.debug(f'Could not acquire lock for record id {row["ID"]}')
+                        continue
+
+                    update_filter = None
+                    if row["processed_by"] is None:
+                        update_filter = "processed_by IS NULL"
+                    else:
+                        update_filter = f"""processed_by = '{row["processed_by"]}'"""
+
+                    update_sql = f"""
+                    UPDATE mail."MailQueue"
+                    SET processed_by = %s, attempts = attempts + 1
+                    WHERE "ID" = %s
+                    AND {update_filter} -- The processed_by ensures the row is still in the same state from the select
+                    RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", processed_by
+                    """
+
+                    if debug_mode:
+                        logging.debug(cur.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+
+                    try:
                         cur.execute(update_sql, (my_process_identifier, row["ID"]))
                         record = cur.fetchone()
                         if record:
                             claimed_rows.append(record)
+                    except Exception as e:
+                        logging.error(f'Error setting processed_by value ({my_process_identifier}) for record id ({row["ID"]})')
+
 
                 if testing:
                     conn.rollback()
