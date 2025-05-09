@@ -37,6 +37,7 @@ with open(f"{user_home}/scripts/db_params.json") as f:
     db_params["password"] = pgpassword
 
 # Globals
+conn = None
 sg = None
 sms_client = None
 should_terminate = False
@@ -58,7 +59,6 @@ my_process_identifier = None
 FETCH_LIMIT = 5
 MAX_ATTEMPTS = 3
 MAX_AGE = 15
-ROW_LOCK_NAMESPACE = 91784  # Arbitrary hardcoded namespace for row-level locks
 
 def shutdown(signum, frame):
     global should_terminate
@@ -68,7 +68,7 @@ def shutdown(signum, frame):
 signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
-def fetch_records():
+def process_records():
     constraint = "TRUE"  # Gets all records
     if mode == 'report':
         constraint = '"Attachment" IS NOT NULL'
@@ -84,7 +84,6 @@ def fetch_records():
           processed_by = %s OR
           (processed_by <> %s AND created_at < NOW() - '{MAX_AGE} minutes'::interval)
       )
-      AND pg_try_advisory_xact_lock("ID")
       AND {constraint}
       AND attempts <= {MAX_ATTEMPTS}
     ORDER BY "ID" ASC
@@ -92,86 +91,116 @@ def fetch_records():
     FOR UPDATE SKIP LOCKED
     """
 
-    claimed_rows = []
+    success_count, failed_count, skipped_count = 0, 0, 0
     try:
-        with psycopg2.connect(**db_params, cursor_factory=DictCursor) as conn:
-            with conn.cursor() as cur:
+        cursor = conn.cursor()
+        record = None
+        if debug_mode:
+            logging.debug(cursor.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
+
+        cursor.execute(select_sql, (my_process_identifier, my_process_identifier))
+        rows = cursor.fetchall()
+
+        lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
+        for row in rows:
+            if debug_mode:
+                logging.debug(cursor.mogrify(lock_query, (row["ID"],)).decode())
+
+            cursor.execute(lock_query, (row["ID"],)) # Acquire lock on the row
+            lock_aquired = cursor.fetchone()[0]
+            if not lock_aquired:
                 if debug_mode:
-                    logging.debug(cur.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
+                    logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
+                    skipped_count += 1
+                continue
 
-                cur.execute(select_sql, (my_process_identifier, my_process_identifier))
-                rows = cur.fetchall()
+            update_filter = None
+            if row["processed_by"] is None:
+                update_filter = "processed_by IS NULL"
+            else:
+                update_filter = f"""processed_by = '{row["processed_by"]}'"""
 
-                lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
-                for row in rows:
-                    if debug_mode:
-                        logging.debug(cur.mogrify(lock_query, (row["ID"],)).decode())
-                    cur.execute(lock_query, (row["ID"],))
-                    if not cur.fetchone()[0]: # lock not acquired for the row
-                        if debug_mode:
-                            logging.debug(f'Could not acquire lock for record id {row["ID"]}')
-                        continue
+            update_sql = f"""
+            UPDATE mail."MailQueue"
+            SET processed_by = %s, attempts = attempts + 1
+            WHERE "ID" = %s
+            AND {update_filter} -- Ensures the row is still in the same state from the select
+            RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", attempts, processed_by
+            """
 
-                    update_filter = None
-                    if row["processed_by"] is None:
-                        update_filter = "processed_by IS NULL"
-                    else:
-                        update_filter = f"""processed_by = '{row["processed_by"]}'"""
+            if debug_mode:
+                logging.debug(cursor.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
 
-                    update_sql = f"""
-                    UPDATE mail."MailQueue"
-                    SET processed_by = %s, attempts = attempts + 1
-                    WHERE "ID" = %s
-                    AND {update_filter} -- The processed_by ensures the row is still in the same state from the select
-                    RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", processed_by
-                    """
+            cursor.execute(update_sql, (my_process_identifier, row["ID"])) # Claim the row
+            record = cursor.fetchone()
+            if not record:
+                logging.debug(f'Record id ({row["ID"]}) claimed by another process. Skipping.')
+                skipped_count += 1
+                continue
 
-                    if debug_mode:
-                        logging.debug(cur.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+            message_type, valid = validate_message(record)
 
-                    try:
-                        cur.execute(update_sql, (my_process_identifier, row["ID"]))
-                        record = cur.fetchone()
-                        if record:
-                            claimed_rows.append(record)
-                    except Exception as e:
-                        logging.error(f'Error setting processed_by value ({my_process_identifier}) for record id ({row["ID"]})')
+            if not valid:
+                archive_record(record,False) # Put it in FailedMail. No point in retrying
+                failed_count += 1
+                conn.commit()
+                continue
 
+            success = None
+            if message_type == 'sms':
+                success = send_sms(record)
+            elif message_type == 'email':
+                success = send_email(record)
 
-                if testing:
-                    conn.rollback()
-                else:
-                    conn.commit()
+            if success:
+                success_count += 1
+            else:
+                failed_count += 1
+
+            if success or record["attempts"] == MAX_ATTEMPTS:
+                archive_record(record,success) # Move record from MailQueue to (MailArchive on success | FailedMail on MAX_ATTEMPTS)
+
+            if testing:
+                conn.rollback()
+            else:
+                conn.commit()
+
+        if testing and debug_mode:
+            logging.debug("Test mode enabled. No database changes made")
     except psycopg2.Error as e:
-        logging.error(f"Error retrieving messages: {e}")
-    except Exception as e:
-        logging.exception(f"Unexpected error: {e}")
+        logging.error(f'Error processing record id ({record["ID"]}): {e}')
+    finally:
+        if cursor:
+            cursor.close()
 
-    return claimed_rows
+    return success_count, failed_count, skipped_count
 
-def process_record(record):
+def validate_message(record):
     destination = record["DestinationAddress"]
     target = destination.strip().split('@')[0]
-    if len(destination) < 6 or len(target) < 1: # a@b.me -> anything shorter is prob bogus
-        logging.error(f"Invalid destination address: {destination}")
-        return False
-    result = None
-    if re.fullmatch(r"\d{10}", target): # phone number
-        result = send_sms(record)
-    else:                            # assume email
-        result = send_email(record)
-    return result
+    target = re.sub(r"[\(\)\s\-]","",target) # remove () - and spaces
+    message_type = 'sms' if re.fullmatch(r"\+?\d{10,11}", target) else 'email'
+    result = True
+
+    if message_type == 'email' and not re.fullmatch(r"[^@]+@[^@]+\.[^@]+",destination):
+        if debug_mode:
+            logging.error(f"Invalid destination address: {destination}.")
+        result = False
+
+    return message_type, result
 
 def send_sms(record):
     try:
         if phone_override is not None:
             record["DestinationAddress"] = phone_override
+
         destination = record["DestinationAddress"].strip().split('@')
-        target_phone_number = destination[0]
+        target_phone_number = re.sub(r"[\(\)\s\-\+]+","",destination[0]) # remove () - and spaces
         domain = destination[1] if len(destination) > 1 else None
         subject = record["Subject"].strip()
         body = record["Body"].strip()
         msg = None
+
         if domain == 'txt.att.net': # It's a device
             msg = f"SUBJ:{subject}\nMSG:{body}"
         else:
@@ -180,15 +209,18 @@ def send_sms(record):
         if no_notify is True:
             logging.debug(f"Notifications disabled. No messages will be sent to {target_phone_number}")
             return True # pretend like it worked
+
         message = sms_client.messages.create(
             to = target_phone_number,  # Replace with the recipient"s phone number
             from_ = my_twilio_phone_number,  # Replace with your Twilio phone number
             body = msg,
         )
+
         if debug_mode:
             logging.debug(f"Message to {target_phone_number}")
             logging.debug(f"Body: {msg}")
             logging.debug(f"Status: {message.status}")
+
         if message.error_code:
             raise Exception(f"SMS error {message.error_code} {message.error_message}")
     except Exception as e:
@@ -200,10 +232,8 @@ def send_email(record):
     try:
         if email_override:
             record["DestinationAddress"] = email_override
+
         recipient = record["DestinationAddress"]
-        if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", recipient):
-            logging.error(f"Malformed email address: {recipient}")
-            return False
         sender = record["SourceAddress"]
         sender = 'bamsupport@airgas-rd.com' # override until mail.airgas-rd.com is validated with twilio
         mail = Mail(
@@ -213,6 +243,7 @@ def send_email(record):
         )
         personalization = Personalization()
         personalization.add_to(To(recipient))
+
         if record["CC_Address"] is not None and len(record["CC_Address"].strip().split(',')) > 0:
             cc_list = record["CC_Address"].strip().split(',')
             for cc in cc_list:
@@ -221,6 +252,7 @@ def send_email(record):
                     logging.error(f"Ignoring malformed CC recipient ({val})")
                     continue
                 personalization.add_cc(Cc(val))
+
         if record["BCC_Address"] is not None and len(record["BCC_Address"].strip().split(',')) > 0:
             bcc_list = record["BCC_Address"].strip().split(',')
             for bcc in bcc_list:
@@ -229,6 +261,7 @@ def send_email(record):
                     logging.error(f"Ignoring malformed BCC recipient ({val})")
                     continue
                 personalization.add_bcc(Bcc(val))
+
         mail.add_personalization(personalization)
         if record["Attachment"] and len(record["Attachment"]) > 0:
             basename = re.sub(r'[^\w\-_.]', '_', record["Subject"].strip().lower()) # acs_report_name
@@ -240,6 +273,7 @@ def send_email(record):
             disposition = Disposition("attachment")
             attachment = Attachment(file_content,file_name,file_type,disposition)
             mail.add_attachment(attachment)
+
         if no_notify is True:
             logging.debug(f"Notifications disabled. No messages will be sent to {recipient}")
             return True # pretend like it worked
@@ -250,6 +284,7 @@ def send_email(record):
             logging.debug("Email Payload")
             pprint.pprint(mail.get(), indent=4)
             logging.debug(f"Email response code: {response.status_code}")
+
         if response.status_code < 200 or response.status_code > 204:
             logging.debug(response.to_dict)
             raise Exception(f"Email request failed with code {response.status_code}")
@@ -268,38 +303,28 @@ def archive_record(record,success):
     body = record["Body"]
     processed_by = record["processed_by"]
     table = 'mail."MailArchive"' if success else 'mail."FailedMail"'
-    cur = None
+
     try:
-        with psycopg2.connect(**db_params, cursor_factory = DictCursor) as conn:
-            with conn.cursor() as cur:
-                delete_sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
-                params = (id,)
+        cursor = conn.cursor()
+        delete_sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
+        params = (id,)
 
-                if debug_mode:
-                    logging.debug(cur.mogrify(delete_sql,params).decode())
+        if debug_mode:
+            logging.debug(cursor.mogrify(delete_sql,params).decode())
 
-                if testing:
-                    logging.debug("Test mode enabled. No changes made")
-                else:
-                    cur.execute(delete_sql,params)
+        cursor.execute(delete_sql,params)
 
-                insert_sql = f"INSERT INTO {table}\n"
-                insert_sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
-                insert_sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
-                params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
+        insert_sql = f"INSERT INTO {table}\n"
+        insert_sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
+        insert_sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
+        params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
 
-                if debug_mode:
-                    logging.debug(cur.mogrify(insert_sql,params).decode())
+        if debug_mode:
+            logging.debug(cursor.mogrify(insert_sql,params).decode())
 
-                if testing:
-                    logging.debug("Test mode enabled. No changes made")
-                else:
-                    cur.execute(insert_sql,params)
-                    conn.commit()
+        cursor.execute(insert_sql,params)
     except psycopg2.Error as e:
-        logging.error(f"Error in archive_record: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error in archive_record: {e}")
+        logging.exception(f'Error archiving {record["ID"]}: {e}')
 
 def running_process_check():
     global my_process_identifier
@@ -309,8 +334,10 @@ def running_process_check():
     for process in psutil.process_iter(["cmdline","pid"]):
         pid = process.info["pid"]
         cmdline = process.info["cmdline"]
+
         if cmdline is None:
             continue
+
         for idx, val in enumerate(cmdline):
             script = os.path.basename(val)
             if script == myscriptname and pid != mypid:
@@ -325,12 +352,12 @@ def running_process_check():
                             other_mode = parameter.split('=')[-1].rstrip('s')
                         else: # short format -k 'v'
                             other_mode = args[i].rstrip('s')
-
                     elif parameter in ["-j","--job-id"] or re.match('--job-id=',parameter): # found job id
                         if re.match('--job-id=',parameter):
                             other_job_id = parameter.split('=')[-1]
                         else:
                              other_job_id = args[i]
+
                     if my_process_identifier == f"{hostname}-{other_mode}-{other_job_id}":
                         if debug_mode:
                             logging.debug(f'{script} with identifier "{my_process_identifier}" found. Exiting')
@@ -412,6 +439,7 @@ def initialize_logs():
             current_file_path = __file__ # Special variable holding the path of the current file
             parent_dir_current = os.path.dirname(current_file_path)
             log_dir = os.path.join(parent_dir_current,"logs")
+
         os.makedirs(log_dir, exist_ok=True)
         file_name = f"{my_process_identifier}.log"
         log_file = os.path.join(log_dir, file_name)
@@ -422,7 +450,6 @@ def initialize_logs():
             interval=1,
             backupCount=7
         )
-
         handlers = [file_handler]
 
         if debug_mode:
@@ -439,30 +466,34 @@ def initialize_logs():
         sys.exit(1)
 
 def initialize_clients():
-    global sg, sms_client
-    sg = sendgrid.SendGridAPIClient(sendgrid_api_key)
-    sms_client = Client(account_sid, auth_token)
+    global sg, sms_client, conn
+    try:
+        sg = sendgrid.SendGridAPIClient(sendgrid_api_key)
+        sms_client = Client(account_sid, auth_token)
+        conn = psycopg2.connect(**db_params, cursor_factory=DictCursor)
+    except Exception as e:
+        logging.exception(f"Client initialization error: {e}")
+        sys.exit(1)
 
 def run_worker_loop():
     while not should_terminate:
-        records = fetch_records()
-        processed_count = 0
-        failed_count = 0
-        for record in records:
-            if debug_mode:
-                logging.debug(f"Processing record ID: {record['ID']}")
-            success = process_record(record)
-            archive_record(record, success)
-            if success:
-                processed_count += 1
-            if not success:
-                failed_count += 1
-        if debug_mode and records:
-            logging.debug(f"Batch complete. Processed: {processed_count}, Failed: {failed_count}")
-        if not loop:
-            break
-        time.sleep(interval * random.uniform(0.8, 1.2)) # Don't hammer the DB
+        try:
+            success, failed, skipped = process_records()
+            processed_record_count = success + failed + skipped
 
+            if debug_mode and processed_record_count > 0:
+                logging.debug(f"Batch complete. Success: {success}, Failed: {failed}, Skipped: {skipped}")
+
+            if not loop:
+                if conn:
+                    conn.close()
+                break
+
+            time.sleep(interval * random.uniform(0.8, 1.2)) # Don't hammer the DB
+        except Exception as e:
+            logging.exception(f"Unexpected error: {e}")
+            if conn:
+                conn.close()
 def main():
     parse_args()
     if running_process_check():
