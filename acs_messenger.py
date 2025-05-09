@@ -80,9 +80,9 @@ def process_records():
     FROM mail."MailQueue"
     WHERE "deliveryMethod" IS NULL
       AND (
-          processed_by IS NULL OR
-          processed_by = %s OR
-          (processed_by <> %s AND created_at < NOW() - '{MAX_AGE} minutes'::interval)
+          processed_by IS NULL -- New message
+          OR processed_by = %s -- Previous failure
+          OR (processed_by <> %s AND created_at < NOW() - '{MAX_AGE} minutes'::interval) -- Orphaned message
       )
       AND {constraint}
       AND attempts <= {MAX_ATTEMPTS}
@@ -494,6 +494,8 @@ def run_worker_loop():
             logging.exception(f"Unexpected error: {e}")
             if conn:
                 conn.close()
+            sys.exit(1) # Let cron restart the job
+
 def main():
     parse_args()
     if running_process_check():
