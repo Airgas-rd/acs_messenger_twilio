@@ -60,6 +60,7 @@ my_process_identifier = None
 FETCH_LIMIT = 5
 MAX_ATTEMPTS = 3
 MAX_AGE = 15
+DB_TIMEOUT_SECONDS = 10
 
 def shutdown(signum, frame):
     global should_terminate
@@ -68,6 +69,25 @@ def shutdown(signum, frame):
 
 signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
+
+async def set_timeout(coroutine, timeout=DB_TIMEOUT_SECONDS):
+    try:
+        return await asyncio.wait_for(coroutine, timeout=timeout)
+    except asyncio.TimeoutError:
+        logging.error(f"Database operation timed out: {DB_TIMEOUT_SECONDS} seconds exceeded.")
+        raise
+
+async def reconnect():
+    global conn
+    try:
+        logging.warning("Reconnecting to database...")
+        if conn:
+            await conn.close()
+        conn = await psycopg.AsyncConnection.connect(**db_params, cursor_factory=DictCursor)
+        logging.info("Database connection re-established.")
+    except Exception as e:
+        logging.exception("Failed to reconnect to the database")
+        sys.exit(1)  # fallback to cron restart
 
 async def process_records():
     constraint = "TRUE"  # Gets all records
@@ -99,77 +119,80 @@ async def process_records():
             if debug_mode:
                 logging.debug(cursor.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
 
-            await cursor.execute(select_sql, (my_process_identifier, my_process_identifier))
+            await set_timeout(cursor.execute(select_sql, (my_process_identifier, my_process_identifier)))
             rows = await cursor.fetchall()
 
             lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
             for row in rows:
-                if debug_mode:
-                    logging.debug(cursor.mogrify(lock_query, (row["ID"],)).decode())
-
-                await cursor.execute(lock_query, (row["ID"],)) # Acquire lock on the row
-                lock_aquired = await cursor.fetchone()[0]
-                if not lock_aquired:
+                async with conn.transaction():  # Begins new transaction per row
                     if debug_mode:
-                        logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
+                        logging.debug(cursor.mogrify(lock_query, (row["ID"],)).decode())
+
+                    await set_timeout(cursor.execute(lock_query, (row["ID"],))) # Acquire lock on the row
+                    lock_result = await cursor.fetchone()
+                    lock_acquired = lock_result[0] if lock_result else False
+                    if not lock_acquired:
+                        if debug_mode:
+                            logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
+                            skipped_count += 1
+                        continue
+
+                    update_filter = None
+                    if row["processed_by"] is None:
+                        update_filter = "processed_by IS NULL"
+                    else:
+                        update_filter = f"""processed_by = '{row["processed_by"]}'"""
+
+                    update_sql = f"""
+                    UPDATE mail."MailQueue"
+                    SET processed_by = %s, attempts = attempts + 1
+                    WHERE "ID" = %s
+                    AND {update_filter} -- Ensures the row is still in the same state from the select
+                    RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", attempts, processed_by
+                    """
+
+                    if debug_mode:
+                        logging.debug(cursor.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+
+                    await set_timeout(cursor.execute(update_sql, (my_process_identifier, row["ID"]))) # Claim the row
+                    record = await cursor.fetchone()
+                    if not record:
+                        logging.debug(f'Record id ({row["ID"]}) claimed by another process. Skipping.')
                         skipped_count += 1
-                    continue
+                        continue
 
-                update_filter = None
-                if row["processed_by"] is None:
-                    update_filter = "processed_by IS NULL"
-                else:
-                    update_filter = f"""processed_by = '{row["processed_by"]}'"""
+                    message_type, valid = await validate_message(record)
 
-                update_sql = f"""
-                UPDATE mail."MailQueue"
-                SET processed_by = %s, attempts = attempts + 1
-                WHERE "ID" = %s
-                AND {update_filter} -- Ensures the row is still in the same state from the select
-                RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", attempts, processed_by
-                """
+                    if not valid:
+                        await archive_record(record,False) # Put it in FailedMail. No point in retrying
+                        failed_count += 1
+                        continue
 
-                if debug_mode:
-                    logging.debug(cursor.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+                    success = None
+                    if message_type == 'sms':
+                        success = await send_sms(record)
+                    elif message_type == 'email':
+                        success = await send_email(record)
 
-                await cursor.execute(update_sql, (my_process_identifier, row["ID"])) # Claim the row
-                record = await cursor.fetchone()
-                if not record:
-                    logging.debug(f'Record id ({row["ID"]}) claimed by another process. Skipping.')
-                    skipped_count += 1
-                    continue
+                    if success:
+                        success_count += 1
+                    else:
+                        failed_count += 1
 
-                message_type, valid = await validate_message(record)
+                    if success or record["attempts"] == MAX_ATTEMPTS:
+                        await archive_record(record,success) # Move record from MailQueue to (MailArchive on success | FailedMail on MAX_ATTEMPTS)
 
-                if not valid:
-                    await archive_record(record,False) # Put it in FailedMail. No point in retrying
-                    failed_count += 1
-                    conn.commit()
-                    continue
-
-                success = None
-                if message_type == 'sms':
-                    success = await send_sms(record)
-                elif message_type == 'email':
-                    success = await send_email(record)
-
-                if success:
-                    success_count += 1
-                else:
-                    failed_count += 1
-
-                if success or record["attempts"] == MAX_ATTEMPTS:
-                    await archive_record(record,success) # Move record from MailQueue to (MailArchive on success | FailedMail on MAX_ATTEMPTS)
-
-                if testing:
-                    conn.rollback()
-                else:
-                    conn.commit()
+                    if testing:
+                        raise Exception("Rollback") # Trigger a rollback
 
         if testing and debug_mode:
             logging.debug("Test mode enabled. No database changes made")
-    except psycopg.Error as e:
-        logging.error(f'Error processing record id ({record["ID"]}): {e}')
+    except Exception as e:
+        if testing and str(e) == "Rollback":
+            if debug_mode:
+                logging.debug(f'Rolled back test transaction for record {row["ID"]}')
+        else:
+            logging.exception(f'Error processing record {row["ID"]}: {e}')
 
     return success_count, failed_count, skipped_count
 
@@ -311,7 +334,7 @@ async def archive_record(record,success):
             if debug_mode:
                 logging.debug(cursor.mogrify(delete_sql,params).decode())
 
-            await cursor.execute(delete_sql,params)
+            await set_timeout(cursor.execute(delete_sql,params))
 
             insert_sql = f"INSERT INTO {table}\n"
             insert_sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
@@ -321,7 +344,7 @@ async def archive_record(record,success):
             if debug_mode:
                 logging.debug(cursor.mogrify(insert_sql,params).decode())
 
-            await cursor.execute(insert_sql,params)
+            await set_timeout(cursor.execute(insert_sql,params))
     except psycopg.Error as e:
         logging.exception(f'Error archiving {record["ID"]}: {e}')
 
@@ -379,14 +402,18 @@ async def run_worker_loop():
 
             if not loop:
                 if conn:
-                    conn.close()
+                    await conn.close()
                 break
 
             time.sleep(interval * random.uniform(0.8, 1.2)) # Don't hammer the DB
+        except (psycopg.OperationalError, psycopg.InterfaceError, asyncio.TimeoutError) as e:
+            logging.warning(f"Recoverable DB error: {e}. Attempting reconnect...")
+            await reconnect()
+            continue  # retry loop
         except Exception as e:
             logging.exception(f"Unexpected error: {e}")
             if conn:
-                conn.close()
+                await conn.close()
             sys.exit(1) # Let cron restart the job
 
 def running_process_check():
