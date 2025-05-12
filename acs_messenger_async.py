@@ -69,6 +69,11 @@ def shutdown(signum, frame):
 signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
+def print_sql(sql,params):
+    for val in params:
+        sql = sql.replace('%s',f"'{val}'",1)
+    logging.debug(sql)
+
 async def set_timeout(coroutine, timeout=DB_TIMEOUT_SECONDS):
     try:
         return await asyncio.wait_for(coroutine, timeout=timeout)
@@ -114,27 +119,34 @@ async def process_records():
 
     success_count, failed_count, skipped_count = 0, 0, 0
     try:
-        row = "N/A"
+
         async with conn.cursor() as cursor:
             record = None
+            params =(my_process_identifier, my_process_identifier)
+
             if debug_mode:
-                logging.debug(cursor.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
+                print_sql(select_sql,params)
 
             await set_timeout(cursor.execute(select_sql, (my_process_identifier, my_process_identifier)))
             rows = await cursor.fetchall()
 
             lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
+            record_id = ''
             for row in rows:
+                record_id = row["ID"]
+                processed_by = row["processed_by"]
                 async with conn.transaction():  # Begins new transaction per row
-                    if debug_mode:
-                        logging.debug(cursor.mogrify(lock_query, (row["ID"],)).decode())
+                    params = (row["ID"],)
 
-                    await set_timeout(cursor.execute(lock_query, (row["ID"],))) # Acquire lock on the row
+                    if debug_mode:
+                        print_sql(lock_query,params)
+
+                    await set_timeout(cursor.execute(lock_query, params)) # Acquire lock on the row
                     lock_result = await cursor.fetchone()
-                    lock_acquired = lock_result[0] if lock_result else False
+                    lock_acquired = lock_result.get("pg_try_advisory_xact_lock", False) if lock_result else False
                     if not lock_acquired:
                         if debug_mode:
-                            logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
+                            logging.debug(f'Could not acquire lock for record id {record_id}. Skipping.')
                             skipped_count += 1
                         continue
 
@@ -142,7 +154,7 @@ async def process_records():
                     if row["processed_by"] is None:
                         update_filter = "processed_by IS NULL"
                     else:
-                        update_filter = f"""processed_by = '{row["processed_by"]}'"""
+                        update_filter = f"""processed_by = '{processed_by}'"""
 
                     update_sql = f"""
                     UPDATE mail."MailQueue"
@@ -151,14 +163,14 @@ async def process_records():
                     AND {update_filter} -- Ensures the row is still in the same state from the select
                     RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", attempts, processed_by
                     """
-
+                    params = (my_process_identifier, record_id)
                     if debug_mode:
-                        logging.debug(cursor.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+                        print_sql(update_sql,params)
 
-                    await set_timeout(cursor.execute(update_sql, (my_process_identifier, row["ID"]))) # Claim the row
+                    await set_timeout(cursor.execute(update_sql, params)) # Claim the row
                     record = await cursor.fetchone()
                     if not record:
-                        logging.debug(f'Record id ({row["ID"]}) claimed by another process. Skipping.')
+                        logging.debug(f'Record id ({record_id}) claimed by another process. Skipping.')
                         skipped_count += 1
                         continue
 
@@ -191,9 +203,9 @@ async def process_records():
     except Exception as e:
         if testing and str(e) == "Rollback":
             if debug_mode:
-                logging.debug(f'Rolled back test transaction for record {row["ID"]}')
+                logging.debug(f'Rolled back test transaction for record {record_id}')
         else:
-            logging.exception(f'Error processing record {row["ID"]}: {e}')
+            logging.exception(f'Error processing record {record_id}: {e}')
 
     return success_count, failed_count, skipped_count
 
@@ -333,7 +345,7 @@ async def archive_record(record,success):
             params = (id,)
 
             if debug_mode:
-                logging.debug(cursor.mogrify(delete_sql,params).decode())
+                print_sql(delete_sql,params)
 
             await set_timeout(cursor.execute(delete_sql,params))
 
@@ -343,7 +355,7 @@ async def archive_record(record,success):
             params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
 
             if debug_mode:
-                logging.debug(cursor.mogrify(insert_sql,params).decode())
+                print_sql(insert_sql,params)
 
             await set_timeout(cursor.execute(insert_sql,params))
     except psycopg.Error as e:
