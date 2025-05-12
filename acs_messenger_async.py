@@ -16,7 +16,6 @@ import psycopg
 import sendgrid
 import asyncio
 
-from psycopg2.extras import DictCursor
 from twilio.rest import Client
 from sendgrid.helpers.mail import *
 from logging.handlers import TimedRotatingFileHandler
@@ -83,7 +82,8 @@ async def reconnect():
         logging.warning("Reconnecting to database...")
         if conn:
             await conn.close()
-        conn = await psycopg.AsyncConnection.connect(**db_params, cursor_factory=DictCursor)
+        conn = await psycopg.AsyncConnection.connect(**db_params)
+        conn.row_factory = psycopg.rows.dict_row
         logging.info("Database connection re-established.")
     except Exception as e:
         logging.exception("Failed to reconnect to the database")
@@ -114,6 +114,7 @@ async def process_records():
 
     success_count, failed_count, skipped_count = 0, 0, 0
     try:
+        row = "N/A"
         async with conn.cursor() as cursor:
             record = None
             if debug_mode:
@@ -386,7 +387,8 @@ async def initialize_clients():
     try:
         sg = sendgrid.SendGridAPIClient(sendgrid_api_key)
         sms_client = Client(account_sid, auth_token)
-        conn = await psycopg.AsyncConnection.connect(**db_params, cursor_factory=DictCursor)
+        conn = await psycopg.AsyncConnection.connect(**db_params)
+        conn.row_factory = psycopg.rows.dict_row
     except Exception as e:
         logging.exception(f"Client initialization error: {e}")
         sys.exit(1)
@@ -520,7 +522,7 @@ def parse_args():
         my_process_identifier += f"-{mode}"
     if job_id:
         my_process_identifier += f"-{job_id}"
-    my_process_identifier = my_process_identifier.lower()
+    my_process_identifier = f"{my_process_identifier}-async".lower()
 
 async def main():
     parse_args()
