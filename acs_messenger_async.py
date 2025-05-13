@@ -56,10 +56,13 @@ phone_override = None
 my_process_identifier = None
 
 # Constants
-FETCH_LIMIT = 5
+FETCH_LIMIT = 5 * (os.cpu_count() or 1)
 MAX_ATTEMPTS = 3
 MAX_AGE = 15
 DB_TIMEOUT_SECONDS = 10
+MAX_CONCURRENT_TASKS = min(32, 5 * (os.cpu_count() or 1))
+
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS) # Prevent excessive async calls to twilio api
 
 def shutdown(signum, frame):
     global should_terminate
@@ -135,76 +138,80 @@ async def process_records():
             for row in rows:
                 record_id = row["ID"]
                 processed_by = row["processed_by"]
-                async with conn.transaction():  # Begins new transaction per row
-                    params = (row["ID"],)
 
+
+                params = (row["ID"],)
+
+                if debug_mode:
+                    print_sql(lock_query,params)
+
+                await set_timeout(cursor.execute(lock_query, params)) # Acquire lock on the row
+                lock_result = await cursor.fetchone()
+                lock_acquired = lock_result.get("pg_try_advisory_xact_lock", False) if lock_result else False
+                if not lock_acquired:
                     if debug_mode:
-                        print_sql(lock_query,params)
-
-                    await set_timeout(cursor.execute(lock_query, params)) # Acquire lock on the row
-                    lock_result = await cursor.fetchone()
-                    lock_acquired = lock_result.get("pg_try_advisory_xact_lock", False) if lock_result else False
-                    if not lock_acquired:
-                        if debug_mode:
-                            logging.debug(f'Could not acquire lock for record id {record_id}. Skipping.')
-                            skipped_count += 1
-                        continue
-
-                    update_filter = None
-                    if row["processed_by"] is None:
-                        update_filter = "processed_by IS NULL"
-                    else:
-                        update_filter = f"""processed_by = '{processed_by}'"""
-
-                    update_sql = f"""
-                    UPDATE mail."MailQueue"
-                    SET processed_by = %s, attempts = attempts + 1
-                    WHERE "ID" = %s
-                    AND {update_filter} -- Ensures the row is still in the same state from the select
-                    RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", attempts, processed_by
-                    """
-                    params = (my_process_identifier, record_id)
-                    if debug_mode:
-                        print_sql(update_sql,params)
-
-                    await set_timeout(cursor.execute(update_sql, params)) # Claim the row
-                    record = await cursor.fetchone()
-                    if not record:
-                        logging.debug(f'Record id ({record_id}) claimed by another process. Skipping.')
+                        logging.debug(f'Could not acquire lock for record id {record_id}. Skipping.')
                         skipped_count += 1
-                        continue
+                    continue
 
-                    message_type, valid = await validate_message(record)
+                update_filter = None
+                if row["processed_by"] is None:
+                    update_filter = "processed_by IS NULL"
+                else:
+                    update_filter = f"""processed_by = '{processed_by}'"""
 
-                    if not valid:
-                        await archive_record(record,False) # Put it in FailedMail. No point in retrying
-                        failed_count += 1
-                        continue
+                update_sql = f"""
+                UPDATE mail."MailQueue"
+                SET processed_by = %s, attempts = attempts + 1
+                WHERE "ID" = %s
+                AND {update_filter} -- Ensures the row is still in the same state from the select
+                RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", attempts, processed_by
+                """
+                params = (my_process_identifier, record_id)
+                if debug_mode:
+                    print_sql(update_sql,params)
 
-                    success = None
+                await set_timeout(cursor.execute(update_sql, params)) # Claim the row
+                record = await cursor.fetchone()
+                if not record:
+                    logging.debug(f'Record id ({record_id}) claimed by another process. Skipping.')
+                    skipped_count += 1
+                    continue
+
+                if not testing: await conn.commit() # You now own the row
+
+                message_type, valid = await validate_message(record)
+
+                if not valid:
+                    await archive_record(cursor,record,False) # Put it in FailedMail. No point in retrying
+                    if not testing: await conn.commit()
+                    failed_count += 1
+                    continue
+
+                success = None
+                async with semaphore:
                     if message_type == 'sms':
                         success = await send_sms(record)
                     elif message_type == 'email':
                         success = await send_email(record)
 
-                    if success:
-                        success_count += 1
-                    else:
-                        failed_count += 1
+                if success:
+                    success_count += 1
+                else:
+                    failed_count += 1
 
-                    if success or record["attempts"] == MAX_ATTEMPTS:
-                        await archive_record(record,success) # Move record from MailQueue to (MailArchive on success | FailedMail on MAX_ATTEMPTS)
+                if success or record["attempts"] == MAX_ATTEMPTS:
+                    await archive_record(cursor,record,success) # Move record from MailQueue to (MailArchive on success | FailedMail on MAX_ATTEMPTS)
+                    if not testing: await conn.commit()
 
-                    if testing:
-                        raise Exception("Rollback") # Trigger a rollback
+                if testing:
+                    if debug_mode:
+                        logging.debug(f'No changes made for record {record_id}')
+                    await conn.rollback()
 
         if testing and debug_mode:
             logging.debug("Test mode enabled. No database changes made")
     except Exception as e:
-        if testing and str(e) == "Rollback":
-            if debug_mode:
-                logging.debug(f'Rolled back test transaction for record {record_id}')
-        else:
             logging.exception(f'Error processing record {record_id}: {e}')
 
     return success_count, failed_count, skipped_count
@@ -243,6 +250,10 @@ async def send_sms(record):
         if no_notify is True:
             logging.debug(f"Notifications disabled. No messages will be sent to {target_phone_number}")
             return True # pretend like it worked
+
+        if testing and not phone_override:
+            logging.warning(f"TESTING MODE ENABLED AND NO PHONE OVERRIDE PROVIDED. No messages sent to {target_phone_number}")
+            return True
 
         message = await asyncio.to_thread(
             sms_client.messages.create,
@@ -313,6 +324,10 @@ async def send_email(record):
             logging.debug(f"Notifications disabled. No messages will be sent to {recipient}")
             return True # pretend like it worked
 
+        if testing and not email_override:
+            logging.warning(f"TESTING MODE ENABLED AND NO EMAIL OVERRIDE PROVIDED. No messages sent to {recipient}")
+            return True
+
         response = await asyncio.to_thread(sg.client.mail.send.post,request_body = mail.get())
 
         if debug_mode:
@@ -328,7 +343,7 @@ async def send_email(record):
         return False
     return True
 
-async def archive_record(record,success):
+async def archive_record(cursor,record,success):
     id = record["ID"]
     source = record["SourceAddress"]
     destination = record["DestinationAddress"]
@@ -340,24 +355,23 @@ async def archive_record(record,success):
     table = 'mail."MailArchive"' if success else 'mail."FailedMail"'
 
     try:
-        async with conn.cursor() as cursor:
-            delete_sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
-            params = (id,)
+        delete_sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
+        params = (id,)
 
-            if debug_mode:
-                print_sql(delete_sql,params)
+        if debug_mode:
+            print_sql(delete_sql,params)
 
-            await set_timeout(cursor.execute(delete_sql,params))
+        await set_timeout(cursor.execute(delete_sql,params))
 
-            insert_sql = f"INSERT INTO {table}\n"
-            insert_sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
-            insert_sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
-            params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
+        insert_sql = f"INSERT INTO {table}\n"
+        insert_sql += f'("DestinationAddress","SourceAddress","CC_Address","BCC_Address","Subject","Body",processed_by,"DateSent")\n'
+        insert_sql += 'VALUES (%s,%s,%s,%s,%s,%s,%s,NOW());'
+        params = (destination,source,cc,bcc,subject,body,processed_by) # discard attachments after sending
 
-            if debug_mode:
-                print_sql(insert_sql,params)
+        if debug_mode:
+            print_sql(insert_sql,params)
 
-            await set_timeout(cursor.execute(insert_sql,params))
+        await set_timeout(cursor.execute(insert_sql,params))
     except psycopg.Error as e:
         logging.exception(f'Error archiving {record["ID"]}: {e}')
 
@@ -534,7 +548,7 @@ def parse_args():
         my_process_identifier += f"-{mode}"
     if job_id:
         my_process_identifier += f"-{job_id}"
-    my_process_identifier = f"{my_process_identifier}-async".lower()
+    my_process_identifier = f"{my_process_identifier}".lower()
 
 async def main():
     parse_args()
