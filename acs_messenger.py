@@ -24,10 +24,11 @@ my_twilio_phone_number = "+18333655808"
 twilio_magic_number_for_testing = "+15005550006"
 hostname = platform.node().split('.')[0]
 
-# Env vars set in /etc/environment
-sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
-account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-auth_token = os.environ.get("TWILIO_CLIENT_AUTH_TOKEN")
+# Env vars set in netadmin .bash_profile
+sendgrid_client_api_key = os.environ.get("SENDGRID_CLIENT_API_KEY")
+twilio_account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+twilio_api_key_sid = os.environ.get("TWILIO_CLIENT_API_KEY_SID")
+twilio_api_key_secret= os.environ.get("TWILIO_CLIENT_API_KEY_SECRET")
 pgpassword = os.environ.get("PGPASSWORD")
 user_home = os.environ.get("HOME")
 
@@ -468,8 +469,8 @@ def initialize_logs():
 def initialize_clients():
     global sg, sms_client, conn
     try:
-        sg = sendgrid.SendGridAPIClient(sendgrid_api_key)
-        sms_client = Client(account_sid, auth_token)
+        sg = sendgrid.SendGridAPIClient(sendgrid_client_api_key)
+        sms_client = Client(twilio_api_key_sid,twilio_api_key_secret,twilio_account_sid)
         conn = psycopg2.connect(**db_params, cursor_factory=DictCursor)
     except Exception as e:
         logging.exception(f"Client initialization error: {e}")
@@ -498,8 +499,8 @@ def run_worker_loop():
 
 def main():
     parse_args()
+    initialize_logs()
     if running_process_check():
-        initialize_logs()
         initialize_clients()
         run_worker_loop()
 

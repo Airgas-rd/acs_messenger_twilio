@@ -24,10 +24,11 @@ my_twilio_phone_number = "+18333655808"
 twilio_magic_number_for_testing = "+15005550006"
 hostname = platform.node().split('.')[0]
 
-# Env vars set in /etc/environment
-sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
-account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-auth_token = os.environ.get("TWILIO_CLIENT_AUTH_TOKEN")
+# Env vars set in netadmin .bash_profile
+sendgrid_client_api_key = os.environ.get("SENDGRID_CLIENT_API_KEY")
+twilio_account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+twilio_api_key_sid = os.environ.get("TWILIO_CLIENT_API_KEY_SID")
+twilio_api_key_secret= os.environ.get("TWILIO_CLIENT_API_KEY_SECRET")
 pgpassword = os.environ.get("PGPASSWORD")
 user_home = os.environ.get("HOME")
 
@@ -411,8 +412,8 @@ async def initialize_logs():
 async def initialize_clients():
     global sg, sms_client, conn
     try:
-        sg = sendgrid.SendGridAPIClient(sendgrid_api_key)
-        sms_client = Client(account_sid, auth_token)
+        sg = sendgrid.SendGridAPIClient(sendgrid_client_api_key)
+        sms_client = Client(twilio_api_key_sid,twilio_api_key_secret,twilio_account_sid)
         conn = await psycopg.AsyncConnection.connect(**db_params)
         conn.row_factory = psycopg.rows.dict_row
     except Exception as e:
@@ -444,7 +445,7 @@ async def run_worker_loop():
                 await conn.close()
             sys.exit(1) # Let cron restart the job
 
-def running_process_check():
+async def running_process_check():
     global my_process_identifier
     mypid = os.getpid()
     myscriptname = os.path.basename(__file__)
@@ -483,7 +484,7 @@ def running_process_check():
                     i += 1
     return True
 
-def print_usage():
+async def print_usage():
     print("""
 Usage: acs_messenger.py [options] [arguments]
 Options:
@@ -500,7 +501,7 @@ Options:
   -h, --help        Show this help message and exit
 """)
 
-def parse_args():
+async def parse_args():
     global mode, loop, debug_mode, testing, no_notify, email_override
     global phone_override, job_id, interval, log_dir, my_process_identifier
 
@@ -551,9 +552,9 @@ def parse_args():
     my_process_identifier = f"{my_process_identifier}".lower()
 
 async def main():
-    parse_args()
-    if running_process_check():
-        await initialize_logs()
+    await parse_args()
+    await initialize_logs()
+    if await running_process_check():
         await initialize_clients()
         await run_worker_loop()
 
