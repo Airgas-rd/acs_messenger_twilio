@@ -47,12 +47,12 @@ for i in $(seq 1 "$JOB_COUNT"); do
   job_id=$(printf "%02d" "$i")
 
   (
-    exec python3 /home/netadmin/scripts/acs_messenger_twilio/acs_messenger.py \
+    exec python3 /home/netadmin/scripts/acs_messenger_twilio/acs_messenger_async.py \
       --debug --mode=notification --loop --job-id="$job_id"
   ) &
 
   (
-    exec python3 /home/netadmin/scripts/acs_messenger_twilio/acs_messenger.py \
+    exec python3 /home/netadmin/scripts/acs_messenger_twilio/acs_messenger_async.py \
       --debug --mode=report --loop --job-id="$job_id"
   ) &
 done
