@@ -152,7 +152,7 @@ async def process_records():
                 if not lock_acquired:
                     if debug_mode:
                         logging.debug(f'Could not acquire lock for record id {record_id}. Skipping.')
-                        skipped_count += 1
+                    skipped_count += 1
                     continue
 
                 update_filter = None

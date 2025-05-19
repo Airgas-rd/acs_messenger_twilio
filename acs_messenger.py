@@ -112,7 +112,7 @@ def process_records():
             if not lock_aquired:
                 if debug_mode:
                     logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
-                    skipped_count += 1
+                skipped_count += 1
                 continue
 
             update_filter = None
