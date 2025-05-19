@@ -118,8 +118,10 @@ def process_records():
             update_filter = None
             if row["processed_by"] is None:
                 update_filter = "processed_by IS NULL"
+                params = (my_process_identifier, row["ID"])
             else:
-                update_filter = f"""processed_by = '{row["processed_by"]}'"""
+                update_filter = "processed_by = %s"
+                params = (my_process_identifier, row["ID"], row["processed_by"])
 
             update_sql = f"""
             UPDATE mail."MailQueue"
@@ -130,9 +132,9 @@ def process_records():
             """
 
             if debug_mode:
-                logging.debug(cursor.mogrify(update_sql, (my_process_identifier, row["ID"])).decode())
+                logging.debug(cursor.mogrify(update_sql, params).decode())
 
-            cursor.execute(update_sql, (my_process_identifier, row["ID"])) # Claim the row
+            cursor.execute(update_sql, params) # Claim the row
             record = cursor.fetchone()
             if not record:
                 logging.debug(f'Record id ({row["ID"]}) claimed by another process. Skipping.')
@@ -169,7 +171,8 @@ def process_records():
         if testing and debug_mode:
             logging.debug("Test mode enabled. No database changes made")
     except psycopg2.Error as e:
-        logging.error(f'Error processing record id ({record["ID"]}): {e}')
+        rid = record["ID"] if record else "Unknown"
+        logging.exception(f"Error processing record id ({rid})")
     finally:
         if cursor:
             cursor.close()

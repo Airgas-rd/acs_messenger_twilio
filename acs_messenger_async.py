@@ -158,8 +158,10 @@ async def process_records():
                 update_filter = None
                 if row["processed_by"] is None:
                     update_filter = "processed_by IS NULL"
+                    params = (my_process_identifier, row["ID"])
                 else:
-                    update_filter = f"""processed_by = '{processed_by}'"""
+                    update_filter = "processed_by = %s"
+                    params = (my_process_identifier, row["ID"], row["processed_by"])
 
                 update_sql = f"""
                 UPDATE mail."MailQueue"
@@ -168,7 +170,6 @@ async def process_records():
                 AND {update_filter} -- Ensures the row is still in the same state from the select
                 RETURNING "ID", "DestinationAddress", "SourceAddress", "CC_Address", "BCC_Address", "Subject", "Body", "Attachment", attempts, processed_by
                 """
-                params = (my_process_identifier, record_id)
                 if debug_mode:
                     print_sql(update_sql,params)
 
@@ -213,7 +214,8 @@ async def process_records():
         if testing and debug_mode:
             logging.debug("Test mode enabled. No database changes made")
     except Exception as e:
-            logging.exception(f'Error processing record {record_id}: {e}')
+            rid = record["ID"] if record else "Unknown"
+            logging.exception(f"Error processing record id ({rid})")
 
     return success_count, failed_count, skipped_count
 
@@ -434,7 +436,7 @@ async def run_worker_loop():
                     await conn.close()
                 break
 
-            time.sleep(interval * random.uniform(0.8, 1.2)) # Don't hammer the DB
+            await asyncio.sleep(interval * random.uniform(0.8, 1.2)) # Don't hammer the DB
         except (psycopg.OperationalError, psycopg.InterfaceError, asyncio.TimeoutError) as e:
             logging.warning(f"Recoverable DB error: {e}. Attempting reconnect...")
             await reconnect()
