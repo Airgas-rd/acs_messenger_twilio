@@ -108,7 +108,8 @@ async def process_records():
     select_sql = f"""
     SELECT "ID", processed_by
     FROM mail."MailQueue"
-    WHERE "deliveryMethod" IS NULL
+    WHERE pg_try_advisory_xact_lock("ID")
+      AND "deliveryMethod" IS NULL
       AND (
           processed_by IS NULL -- New message
           OR processed_by = %s -- Previous failure
@@ -131,37 +132,22 @@ async def process_records():
             if debug_mode:
                 print_sql(select_sql,params)
 
-            await set_timeout(cursor.execute(select_sql, (my_process_identifier, my_process_identifier)))
+            await set_timeout(cursor.execute(select_sql, params))
             rows = await cursor.fetchall()
 
-            lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
             record_id = ''
             for row in rows:
                 record_id = row["ID"]
                 processed_by = row["processed_by"]
 
-
-                params = (row["ID"],)
-
-                if debug_mode:
-                    print_sql(lock_query,params)
-
-                await set_timeout(cursor.execute(lock_query, params)) # Acquire lock on the row
-                lock_result = await cursor.fetchone()
-                lock_acquired = lock_result.get("pg_try_advisory_xact_lock", False) if lock_result else False
-                if not lock_acquired:
-                    if debug_mode:
-                        logging.debug(f'Could not acquire lock for record id {record_id}. Skipping.')
-                    skipped_count += 1
-                    continue
-
+                params = None
                 update_filter = None
-                if row["processed_by"] is None:
+                if processed_by is None:
                     update_filter = "processed_by IS NULL"
-                    params = (my_process_identifier, row["ID"])
+                    params = (my_process_identifier, record_id)
                 else:
                     update_filter = "processed_by = %s"
-                    params = (my_process_identifier, row["ID"], row["processed_by"])
+                    params = (my_process_identifier, record_id, processed_by)
 
                 update_sql = f"""
                 UPDATE mail."MailQueue"

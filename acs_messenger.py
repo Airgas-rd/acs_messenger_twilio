@@ -79,7 +79,8 @@ def process_records():
     select_sql = f"""
     SELECT "ID", processed_by
     FROM mail."MailQueue"
-    WHERE "deliveryMethod" IS NULL
+    WHERE pg_try_advisory_xact_lock("ID")
+      AND "deliveryMethod" IS NULL
       AND (
           processed_by IS NULL -- New message
           OR processed_by = %s -- Previous failure
@@ -96,24 +97,14 @@ def process_records():
     try:
         cursor = conn.cursor()
         record = None
+        params = (my_process_identifier,) * 2
         if debug_mode:
-            logging.debug(cursor.mogrify(select_sql, (my_process_identifier, my_process_identifier)).decode())
+            logging.debug(cursor.mogrify(select_sql, params).decode())
 
-        cursor.execute(select_sql, (my_process_identifier, my_process_identifier))
+        cursor.execute(select_sql, params)
         rows = cursor.fetchall()
 
-        lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
         for row in rows:
-            if debug_mode:
-                logging.debug(cursor.mogrify(lock_query, (row["ID"],)).decode())
-
-            cursor.execute(lock_query, (row["ID"],)) # Acquire lock on the row
-            lock_aquired = cursor.fetchone()[0]
-            if not lock_aquired:
-                if debug_mode:
-                    logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
-                skipped_count += 1
-                continue
 
             update_filter = None
             if row["processed_by"] is None:
@@ -144,7 +135,7 @@ def process_records():
             message_type, valid = validate_message(record)
 
             if not valid:
-                archive_record(record,False) # Put it in FailedMail. No point in retrying
+                archive_record(cursor,record,False) # Put it in FailedMail. No point in retrying
                 failed_count += 1
                 conn.commit()
                 continue
@@ -161,7 +152,7 @@ def process_records():
                 failed_count += 1
 
             if success or record["attempts"] == MAX_ATTEMPTS:
-                archive_record(record,success) # Move record from MailQueue to (MailArchive on success | FailedMail on MAX_ATTEMPTS)
+                archive_record(cursor,record,success) # Move record from MailQueue to (MailArchive on success | FailedMail on MAX_ATTEMPTS)
 
             if testing:
                 conn.rollback()
@@ -297,7 +288,7 @@ def send_email(record):
         return False
     return True
 
-def archive_record(record,success):
+def archive_record(cursor,record,success):
     id = record["ID"]
     source = record["SourceAddress"]
     destination = record["DestinationAddress"]
@@ -309,7 +300,6 @@ def archive_record(record,success):
     table = 'mail."MailArchive"' if success else 'mail."FailedMail"'
 
     try:
-        cursor = conn.cursor()
         delete_sql = 'DELETE FROM mail."MailQueue" WHERE "ID" = %s;'
         params = (id,)
 
