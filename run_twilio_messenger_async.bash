@@ -1,9 +1,8 @@
-#!/usr/bin/bash
+#!/usr/bin/env bash
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-script_name=$(basename "$0")
-script_base="${script_name%.*}"
-
+directory="/home/netadmin/scripts/acs_messenger_twilio"
+filename="acs_messenger_async.py"
+script="$directory/$filename"
 JOB_COUNT=""
 
 # --- Parse named arguments ---
@@ -28,7 +27,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-JOB_COUNT="${JOB_COUNT:-1}" # Default to 1 job if count not specified
+JOB_COUNT="${JOB_COUNT:-1}" # Default to 1 job
 
 # --- Validate job count ---
 if ! [[ "$JOB_COUNT" =~ ^[1-9][0-9]*$ ]]; then
@@ -36,27 +35,26 @@ if ! [[ "$JOB_COUNT" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-if [ -f "$log_file" ]; then
-  tmp_log=$(mktemp "${log_dir}/tmp_log.XXXXXX")
-  tail -n 1000 "$log_file" > "$tmp_log" && mv "$tmp_log" "$log_file" # Last 5000 lines max
-fi
+# Source environment if available
+[[ -f "$HOME/.bash_profile" ]] && source "$HOME/.bash_profile"
 
-source "$HOME/.bash_profile"
+function launch_jobs() {
+    local mode=$1
 
-for i in $(seq 1 "$JOB_COUNT"); do
-  job_id=$(printf "%02d" "$i")
+    proc_count=$(ps -ef | grep "[p]ython3.*${filename}.*${mode}" | wc -l)
+    if [[ $proc_count -lt $JOB_COUNT ]]; then
+        start_id=$((proc_count + 1))
+        for i in $(seq $start_id $JOB_COUNT); do
+          job_id=$(printf "%02d" "$i")
+          echo "Launching $mode job $job_id"
+          nohup python3 "$script" --mode="$mode" --job-id="$job_id" --loop --debug &
+        done
+    fi
+}
 
-  (
-    exec python3 /home/netadmin/scripts/acs_messenger_twilio/acs_messenger_async.py \
-      --debug --mode=notification --loop --job-id="$job_id"
-  ) &
+launch_jobs "notification" &
+launch_jobs "report" &
 
-  (
-    exec python3 /home/netadmin/scripts/acs_messenger_twilio/acs_messenger_async.py \
-      --debug --mode=report --loop --job-id="$job_id"
-  ) &
-done
-
+# Disown all backgrounded jobs
 disown -a
-
 exit 0
