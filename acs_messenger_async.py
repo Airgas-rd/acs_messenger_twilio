@@ -147,7 +147,7 @@ async def process_records():
 
                 await set_timeout(cursor.execute(lock_query, params)) # Acquire lock on the row
                 result = await cursor.fetchone()
-                lock_aquired = result[0] if result is not None else False
+                lock_aquired = result["pg_try_advisory_xact_lock"] if result is not None else False
                 if not lock_aquired:
                     if debug_mode:
                         logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
