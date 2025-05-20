@@ -104,7 +104,18 @@ def process_records():
         cursor.execute(select_sql, params)
         rows = cursor.fetchall()
 
+        lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
         for row in rows:
+            if debug_mode:
+                logging.debug(cursor.mogrify(lock_query, (row["ID"],)).decode())
+
+            cursor.execute(lock_query, (row["ID"],)) # Acquire lock on the row
+            lock_aquired = cursor.fetchone()[0]
+            if not lock_aquired:
+                if debug_mode:
+                    logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
+                skipped_count += 1
+                continue
 
             update_filter = None
             if row["processed_by"] is None:

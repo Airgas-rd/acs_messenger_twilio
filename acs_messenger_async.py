@@ -136,11 +136,24 @@ async def process_records():
             rows = await cursor.fetchall()
 
             record_id = ''
+            lock_query = "SELECT pg_try_advisory_xact_lock(%s);"
             for row in rows:
                 record_id = row["ID"]
                 processed_by = row["processed_by"]
 
-                params = None
+                params = (record_id,)
+                if debug_mode:
+                    print_sql(lock_query,params)
+
+                await set_timeout(cursor.execute(lock_query, params)) # Acquire lock on the row
+                result = await cursor.fetchone()
+                lock_aquired = result[0] if result is not None else False
+                if not lock_aquired:
+                    if debug_mode:
+                        logging.debug(f'Could not acquire lock for record id {row["ID"]}. Skipping.')
+                    skipped_count += 1
+                    continue
+
                 update_filter = None
                 if processed_by is None:
                     update_filter = "processed_by IS NULL"
