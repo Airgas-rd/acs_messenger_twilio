@@ -3,7 +3,6 @@ import re
 import psutil
 import sys
 import json
-import time
 import signal
 import random
 import logging
