@@ -19,11 +19,17 @@ from twilio.rest import Client
 from sendgrid.helpers.mail import *
 from logging.handlers import TimedRotatingFileHandler
 
-my_twilio_phone_number = "+18333655808"
-twilio_magic_number_for_testing = "+15005550006"
-hostname = platform.node().split('.')[0]
+# Constants
+TWILIO_MAGIC_PHONE_NUMBER_FOR_TESTING = "+15005550006"
+HOSTNAME = platform.node().split('.')[0]
+FETCH_LIMIT = 5 * (os.cpu_count() or 1)
+MAX_ATTEMPTS = 3
+MAX_AGE = 15
+DB_TIMEOUT_SECONDS = 10
+MAX_CONCURRENT_TASKS = min(32, 5 * (os.cpu_count() or 1))
 
 # Env vars set in netadmin .bash_profile
+my_twilio_phone_number = os.environ.get("TWILIO_PHONE_NUMBER")
 sendgrid_client_api_key = os.environ.get("SENDGRID_CLIENT_API_KEY")
 twilio_account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 twilio_api_key_sid = os.environ.get("TWILIO_CLIENT_API_KEY_SID")
@@ -55,12 +61,6 @@ email_override = None
 phone_override = None
 my_process_identifier = None
 
-# Constants
-FETCH_LIMIT = 5 * (os.cpu_count() or 1)
-MAX_ATTEMPTS = 3
-MAX_AGE = 15
-DB_TIMEOUT_SECONDS = 10
-MAX_CONCURRENT_TASKS = min(32, 5 * (os.cpu_count() or 1))
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS) # Prevent excessive async calls to twilio api
 
@@ -477,7 +477,7 @@ async def running_process_check():
                         else:
                              other_job_id = args[i]
 
-                    if my_process_identifier == f"{hostname}-{other_mode}-{other_job_id}":
+                    if my_process_identifier == f"{HOSTNAME}-{other_mode}-{other_job_id}":
                         if debug_mode:
                             logging.debug(f'{script} with identifier "{my_process_identifier}" found. Exiting')
                         return False
@@ -494,7 +494,7 @@ Options:
   -t, --testing     Dry run (no DB changes)
   -n, --no-notify   Skip sending SMS or email
   -e, --email       Override email recipient
-  -p, --phone       Override SMS recipient
+  -p, --phone       Override SMS recipient (or 'twilio' for testing)
   -j, --job-id      Custom job identifier
   -i, --interval    Polling interval (seconds)
   -L, --log-dir     Custom log directory
@@ -525,7 +525,7 @@ async def parse_args():
             elif opt in ["-e", "--email"]:
                 email_override = arg.strip()
             elif opt in ["-p", "--phone"]:
-                phone_override = twilio_magic_number_for_testing if arg.strip().lower() == 'twilio' else arg.strip()
+                phone_override = TWILIO_MAGIC_PHONE_NUMBER_FOR_TESTING if arg.strip().lower() == 'twilio' else arg.strip()
             elif opt in ["-m", "--mode"]:
                 mode = re.sub(r's$', '', arg.strip().lower())
             elif opt in ["-j", "--job-id"]:
@@ -544,7 +544,7 @@ async def parse_args():
         print_usage()
         sys.exit(1)
 
-    my_process_identifier = hostname
+    my_process_identifier = HOSTNAME
     if mode:
         my_process_identifier += f"-{mode}"
     if job_id:
