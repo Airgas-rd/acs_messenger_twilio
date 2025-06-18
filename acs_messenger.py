@@ -174,6 +174,8 @@ def process_records():
     except psycopg2.Error as e:
         rid = record["ID"] if record else "Unknown"
         logging.exception(f"Error processing record id ({rid})")
+        if conn:
+            conn.rollback()
     finally:
         if cursor:
             cursor.close()
