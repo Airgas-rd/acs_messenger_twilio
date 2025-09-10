@@ -38,7 +38,7 @@ pgpassword = os.environ.get("PGPASSWORD")
 user_home = os.environ.get("HOME")
 
 # DB config
-with open(f"{user_home}/scripts/db_params.json") as f:
+with open(f"/home/netadmin/scripts/db_params.json") as f:
     db_params = json.load(f)
     db_params["password"] = pgpassword
 
