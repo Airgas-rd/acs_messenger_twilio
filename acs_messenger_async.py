@@ -35,7 +35,6 @@ twilio_account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 twilio_api_key_sid = os.environ.get("TWILIO_CLIENT_API_KEY_SID")
 twilio_api_key_secret= os.environ.get("TWILIO_CLIENT_API_KEY_SECRET")
 pgpassword = os.environ.get("PGPASSWORD")
-user_home = os.environ.get("HOME")
 
 # DB config
 with open(f"/home/netadmin/scripts/db_params.json") as f:
