@@ -14,19 +14,21 @@ import datetime
 import psycopg
 import sendgrid
 import asyncio
+import math
 
 from twilio.rest import Client
 from sendgrid.helpers.mail import *
 from logging.handlers import TimedRotatingFileHandler
 
 # Constants
+CPU_COUNT = os.cpu_count() or 1
 TWILIO_MAGIC_PHONE_NUMBER_FOR_TESTING = "+15005550006"
 HOSTNAME = platform.node().split('.')[0]
-FETCH_LIMIT = 5 * (os.cpu_count() or 1)
+FETCH_LIMIT = math.ceil(CPU_COUNT / 4) # Number of records to fetch 1/4 of total CPU cores
 MAX_ATTEMPTS = 3
 MAX_AGE = 15
 DB_TIMEOUT_SECONDS = 10
-MAX_CONCURRENT_TASKS = min(32, 5 * (os.cpu_count() or 1))
+MAX_CONCURRENT_TASKS = math.ceil(CPU_COUNT/ 4) # Limit of concurrent async tasks to avoid hitting Twilio API rate limits
 
 # Env vars set in netadmin .bash_profile
 my_twilio_phone_number = os.environ.get("TWILIO_PHONE_NUMBER")
@@ -511,7 +513,7 @@ async def parse_args():
         ])
         for opt, arg in opts:
             if opt in ["-h", "--help"]:
-                print_usage()
+                await print_usage()
                 sys.exit(0)
             elif opt in ["-d", "--debug"]:
                 debug_mode = True
